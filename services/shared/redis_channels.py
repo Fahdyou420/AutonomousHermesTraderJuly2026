@@ -1,0 +1,16 @@
+# Redis Pub/Sub Channel Constants for Hermes Trading Agent
+
+NEW_BAR = "hermes:market:new_bar"
+BACKTEST_CHUNK = "hermes:backtest:chunk"
+BACKTEST_COMPLETE = "hermes:backtest:complete"
+NEW_DOCUMENT_CHUNK = "hermes:rags:new_document_chunk"
+SIGNAL_APPROVED = "hermes:signal:approved"
+SIGNAL_REJECTED = "hermes:signal:rejected"
+TRADE_OPENED = "hermes:trade:opened"
+TRADE_CLOSED = "hermes:trade:closed"
+PAPER_TRADE_UPDATE = "hermes:trade:paper_update"
+AGENT_MESSAGE = "hermes:agent:message"
+AGENT_TOOL_CALL = "hermes:agent:tool_call"
+CHART_DRAW_CMD = "hermes:chart:draw_command"
+ORDER_CMD = "hermes:order:execution_command"
+ACCOUNT_UPDATE = "hermes:account:update"

@@ -1,0 +1,202 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: hermes_redis
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+
+  chromadb:
+    image: chromadb/chroma:0.4.24
+    container_name: hermes_chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/index_data
+    restart: always
+
+  mt5_bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_mt5_bridge
+    command: python -m services.mt5_bridge
+    ports:
+      - "5558:5558"   # HTTP/FastAPI — internal service calls
+      - "5555:5555"   # ZMQ PULL — EA pushes bar/trade data here
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  doc_ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_doc_ingestor
+    command: python -m services.doc_ingestor
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - chromadb
+    restart: always
+
+  embedder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_embedder
+    command: python -m services.embedder
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - chromadb
+    restart: always
+
+  preprocessor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_preprocessor
+    command: python -m services.preprocessor
+    ports:
+      - "5559:5559"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  backtester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_backtester
+    command: python -m services.backtester
+    ports:
+      - "5560:5560"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  paper_trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_paper_trader
+    command: python -m services.paper_trader
+    ports:
+      - "5561:5561"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  mcp_bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_mcp_bridge
+    command: python -m services.mcp_bridge
+    ports:
+      - "5562:5562"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  execution:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_execution
+    command: python -m services.execution
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes_dashboard
+    command: python -m dashboard.app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: hermes_app
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mt5_bridge
+      - paper_trader
+      - preprocessor
+      - chromadb
+    restart: always
+
+volumes:
+  redis_data:
+  chromadb_data:

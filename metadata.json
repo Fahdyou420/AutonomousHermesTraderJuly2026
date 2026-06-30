@@ -1,0 +1,6 @@
+{
+  "name": "Hermes Trading Agent",
+  "description": "Autonomous SMC/ICT trading dashboard for XAUUSD with backtesting, real-time trade monitoring, and AI-driven skill improvement.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

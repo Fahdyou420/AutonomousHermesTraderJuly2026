@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD THIS TO YOUR ~/.hermes/config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. MCP server — exposes your trading stack as tools Hermes can call
+mcp_servers:
+  hermes_trading:
+    url: http://localhost:7779/mcp
+    # No auth needed since it's local-only
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - get_market_bars
+        - get_account_state
+        - get_open_positions
+        - get_trading_stats
+        - get_trade_history
+        - send_paper_trade
+        - close_position
+        - run_backtest
+        - get_smc_analysis
+        - get_system_status
+        - draw_on_chart
+
+# 2. Model — use your local Ollama (RTX 4060)
+# Run: hermes config set model.provider custom
+# Run: hermes config set model.default hermes3  (or whatever 'ollama list' shows)
+# Or set it here directly:
+model:
+  provider: custom
+  default: hermes3    # change to match your exact Ollama model name
+  base_url: http://localhost:11434/v1
+  api_key: ollama     # Ollama accepts any string
+
+# 3. Ollama for auxiliary tasks (vision, compression, etc)
+auxiliary:
+  compression:
+    provider: custom
+    base_url: http://localhost:11434/v1
+    model: hermes3
+    api_key: ollama
+  vision:
+    provider: custom
+    base_url: http://localhost:11434/v1
+    model: hermes3
+    api_key: ollama
+
+# 4. Context file size — larger for trading analysis
+context_file_max_chars: 25000
+file_read_max_chars: 150000
+
+# 5. Tool output — trading data can be large
+tool_output:
+  max_bytes: 100000
+  max_lines: 5000
+
+# 6. Disable tools you don't need (keeps context clean)
+agent:
+  disabled_toolsets:
+    - browser    # not needed for trading
+    - email      # not needed
+  max_turns: 150  # trading analysis can be long
+  tool_use_enforcement: true  # force tool calls, not text descriptions
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRON JOBS — add these via: hermes cron
+# Or manually add to ~/.hermes/cron/
+# ─────────────────────────────────────────────────────────────────────────────
+# */15 * * * *   Run the SMC trading scan and monitor
+#   hermes chat "Use the smc_trading_cycle skill, phase: scan. Then phase: monitor."
+#
+# 0 */4 * * *    Research and backtest queued setups
+#   hermes chat "Use the smc_trading_cycle skill, phase: research."
+#
+# 0 22 * * *     Daily review at 22:00 UTC (after NY close)
+#   hermes chat "Use the smc_trading_cycle skill, phase: review."
+# ─────────────────────────────────────────────────────────────────────────────

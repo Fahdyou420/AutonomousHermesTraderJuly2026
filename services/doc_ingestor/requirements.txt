@@ -1,0 +1,4 @@
+pymupdf>=1.22.0
+watchdog>=3.0.0
+redis>=5.0.0
+python-dotenv>=1.0.0

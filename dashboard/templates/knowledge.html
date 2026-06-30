@@ -1,0 +1,378 @@
+{% extends "base.html" %}
+
+{% block content %}
+<!-- Include marked.js for fast client-side markdown compilation -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+<div class="absolute inset-0 flex divide-x divide-gray-900 overflow-hidden">
+    
+    <!-- Left Workspace Panel: Search and Folder Tree (32%) -->
+    <div class="w-80 lg:w-96 flex flex-col bg-gray-950/60 overflow-hidden select-none">
+        
+        <!-- Search Header -->
+        <div class="flex-none p-4 border-b border-gray-900">
+            <div class="relative">
+                <input type="text" id="vault-search-input" 
+                       class="w-full bg-gray-950 text-sm font-mono placeholder-gray-600 pl-8 pr-12 py-2 rounded border border-gray-900 focus:border-amber-500/50 outline-none transition"
+                       placeholder="Full-text vault search..."
+                       autocomplete="off"
+                       oninput="triggerVaultSearch()">
+                <div class="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-600 pointer-events-none">
+                    <i data-lucide="search" class="w-4 h-4"></i>
+                </div>
+                <!-- Mini Spinner -->
+                <div id="search-spinner" class="absolute right-3 top-1/2 -translate-y-1/2 text-amber-500 hidden animate-spin">
+                    <i data-lucide="loader-2" class="w-3.5 h-3.5"></i>
+                </div>
+            </div>
+            
+            <!-- Search Results Display Area -->
+            <div id="vault-search-results" class="hidden mt-2 p-1 max-h-48 overflow-y-auto bg-gray-950 border border-gray-900 rounded divide-y divide-gray-950/80">
+                <!-- Search Items filled dynamically -->
+            </div>
+        </div>
+
+        <!-- Toggle Section (Folders vs Recent) -->
+        <div class="flex-none flex border-b border-gray-900 bg-gray-950/50 text-xs font-mono text-gray-500">
+            <button onclick="switchTab('explorer')" id="tab-explorer" class="flex-1 py-2.5 border-b-2 border-amber-500 text-amber-500 font-bold transition focus:outline-none">
+                File Explorer
+            </button>
+            <button onclick="switchTab('recent')" id="tab-recent" class="flex-1 py-2.5 border-b-2 border-transparent hover:text-gray-300 transition focus:outline-none">
+                Recent Studies
+            </button>
+        </div>
+
+        <!-- Scrollable Folder Tree Explorer -->
+        <div id="panel-explorer" class="flex-1 overflow-y-auto p-4 font-mono text-xs text-gray-400">
+            <div id="file-tree-root" class="space-y-1.5">
+                <div class="text-gray-600 text-xs italic">Loading vault structure...</div>
+            </div>
+        </div>
+
+        <!-- Scrollable Recent Notes list -->
+        <div id="panel-recent" class="flex-1 overflow-y-auto p-4 hidden">
+            <span class="text-[9px] font-mono text-gray-600 uppercase font-bold tracking-wider block mb-3">LAST 20 MODIFIED STUDIES:</span>
+            <div id="recent-notes-list" class="space-y-2 text-xs font-mono">
+                <div class="text-gray-600 italic">No notes found.</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Right Workspace Panel: Full Markdown View (68%) -->
+    <div class="flex-1 flex flex-col bg-gray-950/20 overflow-hidden">
+        
+        <!-- Note Toolbar / Frontmatter Header -->
+        <div id="view-header" class="flex-none bg-gray-900/10 border-b border-gray-900 px-6 py-4 hidden">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 id="note-title" class="text-lg font-bold text-gray-100 tracking-tight">Active Note</h1>
+                    <p id="note-rel-path" class="text-[10px] font-mono text-gray-500 mt-1">01_MARKET_STUDIES/...</p>
+                </div>
+                <!-- Dynamic Chips for metadata -->
+                <div id="note-metadata" class="flex items-center space-x-1.5">
+                    <!-- Chips live here -->
+                </div>
+            </div>
+        </div>
+        
+        <!-- Empty Placeholder state -->
+        <div id="view-placeholder" class="flex-1 flex flex-col items-center justify-center p-12 text-center text-gray-600 select-none">
+            <div class="w-12 h-12 rounded bg-gray-900 border border-gray-800/80 flex items-center justify-center mb-4 text-gray-500">
+                <i data-lucide="book-open" class="w-6 h-6"></i>
+            </div>
+            <h3 class="text-sm font-semibold text-gray-400">No Document Selected</h3>
+            <p class="text-xs text-gray-500 mt-1 max-w-xs font-mono leading-relaxed">Select a market study or policy strategy from the left file tree to inspect details.</p>
+        </div>
+
+        <!-- Markdown rendered content page -->
+        <div id="view-body" class="flex-1 overflow-y-auto px-8 py-6 hidden">
+            <!-- Render Target with specific prose rules -->
+            <div id="markdown-container" class="prose prose-invert prose-amber max-w-full text-xs sm:text-sm text-gray-300 leading-relaxed font-sans space-y-4">
+                <!-- Inner HTML populated by marked.js -->
+            </div>
+        </div>
+
+    </div>
+
+</div>
+
+<script>
+    let activeTab = "explorer";
+
+    window.addEventListener('DOMContentLoaded', () => {
+        loadVaultTree();
+        loadRecentNotes();
+    });
+
+    // Toggle navigation tab lists
+    function switchTab(tab) {
+        activeTab = tab;
+        const btnExplorer = document.getElementById('tab-explorer');
+        const btnRecent = document.getElementById('tab-recent');
+        const pnlExplorer = document.getElementById('panel-explorer');
+        const pnlRecent = document.getElementById('panel-recent');
+
+        if(tab === 'explorer') {
+            btnExplorer.className = "flex-1 py-2.5 border-b-2 border-amber-500 text-amber-500 font-bold transition focus:outline-none";
+            btnRecent.className = "flex-1 py-2.5 border-b-2 border-transparent hover:text-gray-300 transition focus:outline-none";
+            pnlExplorer.classList.remove('hidden');
+            pnlRecent.classList.add('hidden');
+        } else {
+            btnRecent.className = "flex-1 py-2.5 border-b-2 border-amber-500 text-amber-500 font-bold transition focus:outline-none";
+            btnExplorer.className = "flex-1 py-2.5 border-b-2 border-transparent hover:text-gray-300 transition focus:outline-none";
+            pnlRecent.classList.remove('hidden');
+            pnlExplorer.classList.add('hidden');
+        }
+    }
+
+    // Load full JSON tree schema
+    async function loadVaultTree() {
+        try {
+            const resp = await fetch('/api/vault/tree');
+            const data = await resp.json();
+            const root = document.getElementById('file-tree-root');
+            root.innerHTML = '';
+            
+            if(data && Array.isArray(data) && data.length > 0) {
+                data.forEach(entry => {
+                    const node = renderTreeNode(entry);
+                    root.appendChild(node);
+                });
+            } else {
+                root.innerHTML = `<div class="p-4 text-center text-gray-600">Vault directory is empty.</div>`;
+            }
+            lucide.createIcons();
+        } catch (e) {
+            document.getElementById('file-tree-root').innerHTML = `<div class="text-red-500 italic">Failed fetching vault tree: ${e.message}</div>`;
+        }
+    }
+
+    // Recursive node builder for the explorer list
+    function renderTreeNode(entry) {
+        const div = document.createElement('div');
+        div.className = "select-none";
+        
+        if (entry.type === 'directory') {
+            const folderHeader = document.createElement('div');
+            folderHeader.className = "flex items-center space-x-1.5 py-1 px-1.5 hover:bg-gray-900 rounded cursor-pointer transition text-gray-300";
+            folderHeader.innerHTML = `
+                <i data-lucide="folder" class="w-3.5 h-3.5 text-amber-500/60 flex-shrink-0"></i>
+                <span class="truncate pr-1">${entry.name}</span>
+            `;
+            
+            const childrenContainer = document.createElement('div');
+            childrenContainer.className = "pl-4 mt-0.5 space-y-1 select-none border-l border-gray-900 ml-2 hidden";
+            
+            entry.children.forEach(child => {
+                const childNode = renderTreeNode(child);
+                childrenContainer.appendChild(childNode);
+            });
+            
+            folderHeader.addEventListener('click', (e) => {
+                e.stopPropagation();
+                childrenContainer.classList.toggle('hidden');
+                const folderIcon = folderHeader.querySelector('i');
+                if (childrenContainer.classList.contains('hidden')) {
+                    folderIcon.setAttribute('data-lucide', 'folder');
+                } else {
+                    folderIcon.setAttribute('data-lucide', 'folder-open');
+                }
+                lucide.createIcons();
+            });
+            
+            div.appendChild(folderHeader);
+            div.appendChild(childrenContainer);
+        } else {
+            const fileItem = document.createElement('div');
+            fileItem.className = "flex items-center space-x-1.5 py-1 px-1.5 hover:bg-gray-900 hover:text-amber-500 rounded cursor-pointer transition text-gray-400";
+            fileItem.innerHTML = `
+                <i data-lucide="file-text" class="w-3.5 h-3.5 text-gray-600 flex-shrink-0"></i>
+                <span class="truncate pr-1">${entry.name}</span>
+            `;
+            
+            fileItem.addEventListener('click', (e) => {
+                e.stopPropagation();
+                loadNoteContent(entry.path);
+            });
+            
+            div.appendChild(fileItem);
+        }
+        
+        return div;
+    }
+
+    // Load Last Modified studies
+    async function loadRecentNotes() {
+        try {
+            const resp = await fetch('/api/vault/recent');
+            const data = await resp.json();
+            const listNode = document.getElementById('recent-notes-list');
+            listNode.innerHTML = '';
+            
+            if(data && Array.isArray(data) && data.length > 0) {
+                data.forEach(note => {
+                    const row = document.createElement('div');
+                    row.className = "p-2 hover:bg-gray-900 border border-transparent hover:border-gray-900 rounded cursor-pointer transition flex items-start justify-between space-x-2";
+                    row.innerHTML = `
+                        <div class="truncate flex-1">
+                            <span class="text-gray-200 hover:text-amber-500 truncate block">${note.title}</span>
+                            <span class="text-[9px] text-gray-600 block mt-0.5 truncate">${note.path}</span>
+                        </div>
+                        <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-gray-600 self-center flex-shrink-0"></i>
+                    `;
+                    row.addEventListener('click', () => loadNoteContent(note.path));
+                    listNode.appendChild(row);
+                });
+                lucide.createIcons();
+            } else {
+                listNode.innerHTML = `<div class="text-gray-600 italic text-center p-4">No recent files found.</div>`;
+            }
+        } catch (e) {
+            console.error("Recent notes fetching error", e);
+        }
+    }
+
+    // Full-Text Search Handler with Debounce
+    let searchTimeout = null;
+    async function triggerVaultSearch() {
+        const input = document.getElementById('vault-search-input');
+        const term = input.value.trim();
+        const resultsBox = document.getElementById('vault-search-results');
+        const spinner = document.getElementById('search-spinner');
+
+        if(searchTimeout) clearTimeout(searchTimeout);
+
+        if (!term) {
+            resultsBox.innerHTML = '';
+            resultsBox.classList.add('hidden');
+            spinner.classList.add('hidden');
+            return;
+        }
+
+        spinner.classList.remove('hidden');
+
+        searchTimeout = setTimeout(async () => {
+            try {
+                const resp = await fetch(`/api/vault/search?q=${encodeURIComponent(term)}`);
+                const data = await resp.json();
+                
+                resultsBox.innerHTML = '';
+                if(data && data.length > 0) {
+                    resultsBox.classList.remove('hidden');
+                    data.forEach(item => {
+                        const cell = document.createElement('div');
+                        cell.className = "p-2 font-mono text-xs hover:bg-gray-900 cursor-pointer transition";
+                        cell.innerHTML = `
+                            <div class="font-bold text-amber-500 truncate">${item.title}</div>
+                            <div class="text-[9px] text-gray-600 truncate mt-0.5">${item.path}</div>
+                            <div class="text-[10px] text-gray-400 line-clamp-2 mt-1 leading-relaxed">${item.excerpt}</div>
+                        `;
+                        cell.addEventListener('click', () => {
+                            resultsBox.classList.add('hidden');
+                            input.value = '';
+                            loadNoteContent(item.path);
+                        });
+                        resultsBox.appendChild(cell);
+                    });
+                } else {
+                    resultsBox.classList.remove('hidden');
+                    resultsBox.innerHTML = `<div class="p-3 text-center text-gray-600 italic">No search matches found.</div>`;
+                }
+            } catch (err) {
+                console.error("Search failed:", err);
+            } finally {
+                spinner.classList.add('hidden');
+            }
+        }, 300);
+    }
+
+    // Surgical Note Fetching and rendering with marked.js
+    async function loadNoteContent(path) {
+        const placeholder = document.getElementById('view-placeholder');
+        const header = document.getElementById('view-header');
+        const body = document.getElementById('view-body');
+        
+        try {
+            const resp = await fetch(`/api/vault/note?path=${encodeURIComponent(path)}`);
+            if(!resp.ok) {
+                const errJson = await resp.json();
+                alert(`Error reading note file: ${errJson.error}`);
+                return;
+            }
+            
+            const data = await resp.json();
+            
+            placeholder.classList.add('hidden');
+            header.classList.remove('hidden');
+            body.classList.remove('hidden');
+            
+            document.getElementById('note-title').textContent = data.title;
+            document.getElementById('note-rel-path').textContent = data.path;
+            
+            // Build dynamic frontmatter chips
+            const chipContainer = document.getElementById('note-metadata');
+            chipContainer.innerHTML = '';
+            
+            if (data.frontmatter) {
+                // Read tags list
+                const tags = data.tags || [];
+                tags.forEach(tg => {
+                    const chip = document.createElement('span');
+                    chip.className = "text-[9px] font-mono text-amber-500 bg-amber-500/5 border border-amber-500/10 px-2 py-0.5 rounded-full uppercase";
+                    chip.textContent = tg;
+                    chipContainer.appendChild(chip);
+                });
+
+                if (data.frontmatter.bias) {
+                    const biasVal = data.frontmatter.bias;
+                    const biasColorClass = biasVal.toLowerCase().includes('bull') ? 'text-emerald-500 bg-emerald-500/5 border-emerald-500/15' : 'text-rose-500 bg-rose-500/5 border-rose-500/15';
+                    
+                    const biasSpan = document.createElement('span');
+                    biasSpan.className = `text-[9px] font-mono border px-2 py-0.5 rounded-full uppercase font-bold ${biasColorClass}`;
+                    biasSpan.textContent = `Bias: ${biasVal}`;
+                    chipContainer.appendChild(biasSpan);
+                }
+            }
+            
+            // Core markdown compilation using marked.js
+            const markdownContainer = document.getElementById('markdown-container');
+            markdownContainer.innerHTML = marked.parse(data.content || "");
+            
+            // Fix heading and elements layout inside parsed html manually for premium look
+            const headings = markdownContainer.querySelectorAll('h1, h2, h3, h4');
+            headings.forEach(h => {
+                h.className = "font-mono font-bold tracking-tight text-amber-500 mt-6 mb-2 border-b border-gray-900 pb-1 flex items-center space-x-1.5 uppercase";
+                if(h.tagName === 'H1') h.className += " text-sm mt-3 border-amber-500/20";
+                if(h.tagName === 'H2') h.className += " text-[11px] text-gray-200 mt-4 border-gray-900";
+            });
+
+            const tables = markdownContainer.querySelectorAll('table');
+            tables.forEach(t => {
+                t.className = "w-full text-xs font-mono border-collapse my-4 border border-gray-900";
+                t.querySelectorAll('th').forEach(th => th.className = "bg-gray-900/30 font-bold border border-gray-900 p-2 text-left text-amber-500/80");
+                t.querySelectorAll('td').forEach(td => td.className = "border border-gray-900 p-2 text-gray-300");
+            });
+
+            const prList = markdownContainer.querySelectorAll('ul, ol');
+            prList.forEach(list => {
+                list.className = "list-disc list-inside pl-4 space-y-1 text-gray-300 my-2";
+            });
+
+            const codeBlocks = markdownContainer.querySelectorAll('pre, code');
+            codeBlocks.forEach(blk => {
+                if(blk.tagName === 'PRE') {
+                    blk.className = "bg-gray-950 border border-gray-900 text-amber-400 p-4 rounded-md font-mono text-xs overflow-x-auto leading-relaxed my-3";
+                } else if(blk.tagName === 'CODE' && !blk.parentElement.tagName === 'PRE') {
+                    blk.className = "bg-gray-900/60 text-amber-400 px-1 py-0.5 rounded font-mono text-xs border border-gray-900";
+                }
+            });
+            
+            lucide.createIcons();
+            
+        } catch (e) {
+            alert(`Network failure: ${e.message}`);
+        }
+    }
+</script>
+{% endblock %}
