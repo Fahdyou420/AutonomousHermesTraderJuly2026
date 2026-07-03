@@ -7,6 +7,7 @@ from flask import Blueprint, request, Response, jsonify
 trades_bp = Blueprint('trades', __name__)
 
 PAPER_TRADER_URL = os.getenv("PAPER_TRADER_URL", "http://paper_trader:5561")
+MT5_BRIDGE_URL    = os.getenv("MT5_BRIDGE_URL", "http://mt5_bridge:5558")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 TRADES_DATA_DIR = os.getenv("TRADES_DATA_DIR", "/data/trades")
 
@@ -40,13 +41,37 @@ def read_last_lines_jsonl(filepath, limit=50):
 
 @trades_bp.route('/positions', methods=['GET'])
 def get_positions():
+    """Returns paper trades AND real MT5 positions, tagged by source."""
+    combined = []
     try:
-        url = f"{PAPER_TRADER_URL}/positions"
-        res = requests.get(url, timeout=10)
-        return jsonify(res.json())
+        res = requests.get(f"{PAPER_TRADER_URL}/positions", timeout=5)
+        paper = res.json() if res.ok else []
+        for p in paper:
+            p["source"] = "paper"
+        combined.extend(paper)
     except Exception as e:
         print(f"Paper Trader offline: {e}")
-        return jsonify([])
+
+    try:
+        res = requests.get(f"{MT5_BRIDGE_URL}/positions", timeout=5)
+        live = res.json() if res.ok else []
+        for p in live:
+            p["source"] = "mt5_live"
+        combined.extend(live)
+    except Exception as e:
+        print(f"MT5 bridge positions unavailable: {e}")
+
+    return jsonify(combined)
+
+@trades_bp.route('/account', methods=['GET'])
+def get_account():
+    """Real MT5 account state: balance, equity, margin, profit."""
+    try:
+        res = requests.get(f"{MT5_BRIDGE_URL}/account_state", timeout=5)
+        return jsonify(res.json() if res.ok else {})
+    except Exception as e:
+        print(f"MT5 bridge account_state unavailable: {e}")
+        return jsonify({"balance": 0, "equity": 0, "margin": 0, "profit": 0})
 
 @trades_bp.route('/history', methods=['GET'])
 def get_history():
@@ -60,22 +85,31 @@ def get_history():
 
 @trades_bp.route('/stats', methods=['GET'])
 def get_stats():
+    stats = {
+        "balance": 0.0, "equity": 0.0, "win_rate": 0.0,
+        "total_trades": 0, "profit_factor": 0.0,
+        "max_drawdown_percent": 0.0, "net_profit": 0.0, "net_r": 0.0
+    }
     try:
-        url = f"{PAPER_TRADER_URL}/stats"
-        res = requests.get(url, timeout=10)
-        return jsonify(res.json())
+        res = requests.get(f"{PAPER_TRADER_URL}/stats", timeout=10)
+        if res.ok:
+            stats.update(res.json())
     except Exception as e:
         print(f"Paper Trader offline: {e}")
-        return jsonify({
-            "balance": 0.0,
-            "equity": 0.0,
-            "win_rate": 0.0,
-            "total_trades": 0,
-            "profit_factor": 0.0,
-            "max_drawdown_percent": 0.0,
-            "net_profit": 0.0,
-            "net_r": 0.0
-        })
+
+    # Overlay real account balance/equity from MT5 — this is what actually matters
+    try:
+        res = requests.get(f"{MT5_BRIDGE_URL}/account_state", timeout=5)
+        if res.ok:
+            acc = res.json()
+            if acc.get("balance"):
+                stats["balance"] = acc["balance"]
+            if acc.get("equity"):
+                stats["equity"] = acc["equity"]
+    except Exception as e:
+        print(f"MT5 bridge account_state unavailable: {e}")
+
+    return jsonify(stats)
 
 @trades_bp.route('/signals/approved', methods=['GET'])
 def get_approved_signals():
@@ -98,6 +132,58 @@ def get_candidates():
     except Exception as e:
         print(f"Paper Trader offline: {e}")
         return jsonify([])
+
+
+EXECUTION_URL = os.getenv("EXECUTION_URL", "http://execution:5563")
+
+@trades_bp.route('/kill', methods=['POST'])
+def trigger_kill():
+    flatten = request.args.get('flatten', 'false').lower() == 'true'
+    try:
+        res = requests.post(f"{EXECUTION_URL}/kill?flatten={str(flatten).lower()}", timeout=10)
+        return jsonify(res.json() if res.ok else {"error": res.text}), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@trades_bp.route('/resume', methods=['POST'])
+def trigger_resume():
+    try:
+        res = requests.post(f"{EXECUTION_URL}/resume", timeout=10)
+        return jsonify(res.json() if res.ok else {"error": res.text}), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@trades_bp.route('/reset', methods=['POST'])
+def trigger_reset():
+    try:
+        res = requests.post(f"{PAPER_TRADER_URL}/reset", timeout=10)
+        return jsonify(res.json() if res.ok else {"error": res.text}), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@trades_bp.route('/pending', methods=['GET'])
+def get_pending_signals():
+    try:
+        res = requests.get(f"{EXECUTION_URL}/pending_signals", timeout=10)
+        return jsonify(res.json() if res.ok else []), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@trades_bp.route('/pending/<signal_id>/approve', methods=['POST'])
+def approve_signal(signal_id):
+    try:
+        res = requests.post(f"{EXECUTION_URL}/signal/{signal_id}/approve", timeout=15)
+        return jsonify(res.json() if res.ok else {"error": res.text}), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@trades_bp.route('/pending/<signal_id>/reject', methods=['POST'])
+def reject_signal(signal_id):
+    try:
+        res = requests.post(f"{EXECUTION_URL}/signal/{signal_id}/reject", timeout=15)
+        return jsonify(res.json() if res.ok else {"error": res.text}), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @trades_bp.route('/stream', methods=['GET'])

@@ -20,11 +20,13 @@ import requests
 # Shared utilities
 from services.shared.logger import get_logger
 from services.shared import redis_channels
+from services.shared.error_bus import publish_error
+from services.shared.kill_switch import is_kill_switch_active
 from services.paper_trader.db import PaperTradeDB
 
 logger = get_logger("paper_trader")
 
-app = FastAPI(title="Hermes Paper Trader Service", version="1.0")
+app = FastAPI(title="Hermes Paper Trader Service", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +46,10 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 # Database instance
 db = PaperTradeDB()
+
+# Failure tracking for MT5 Bridge connectivity
+bridge_fail_since: Optional[float] = None
+CRITICAL_ALERT_TIMEOUT_SEC = 300 # 5 minutes
 
 class TradeSignalInput(BaseModel):
     signal_id: Optional[str] = None
@@ -74,9 +80,14 @@ def model_to_dict(m: BaseModel) -> Dict[str, Any]:
 async def check_active_positions():
     """
     Checks if active positions have hit SL/TP targets using latest bars from mt5_bridge.
+    Also tracks connectivity failures to mt5_bridge and publishes CRITICAL errors if offline.
     """
+    global bridge_fail_since
+    
     open_positions = db.get_open_positions()
     if not open_positions:
+        # Reset failure tracking if there are no open positions to monitor, or keep monitoring if needed
+        # (Only track connection health when we actively need it to manage risk)
         return
         
     for pos in open_positions:
@@ -89,13 +100,17 @@ async def check_active_positions():
             resp = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: requests.get(url, timeout=5)
             )
+            
             if resp.status_code != 200:
-                continue
+                raise requests.RequestException(f"MT5 Bridge returned status code {resp.status_code}")
                 
             bars = resp.json()
             if not bars:
                 continue
                 
+            # Successfully connected and retrieved data — reset failures
+            bridge_fail_since = None
+            
             latest_bar = bars[-1]
             high = float(latest_bar.get("high", 0.0))
             low = float(latest_bar.get("low", 0.0))
@@ -112,7 +127,6 @@ async def check_active_positions():
             reason = ""
             
             if direction in ["long", "buy"]:
-                # If both SL and TP are hit inside the same candle, trigger SL (conservative baseline)
                 if low <= sl and high >= tp:
                     hit_sl = True
                     exit_price = sl
@@ -140,7 +154,7 @@ async def check_active_positions():
                     reason = "tp"
                     
             if hit_sl or hit_tp:
-                close_time = int(latest_bar.get("timestamp", time.time() if "time" not in globals() else 0)) or int(datetime.utcnow().timestamp())
+                close_time = int(latest_bar.get("timestamp", 0)) or int(datetime.utcnow().timestamp())
                 logger.info(f"[!] Trigger check hit. Closing Position: {pos_id} ({instrument}) at {exit_price}. Reason: {reason}")
                 db.close_position(pos_id, exit_price, reason, close_time=close_time)
                 
@@ -152,11 +166,21 @@ async def check_active_positions():
                     
                 if updated_row:
                     updated_dict = dict(updated_row)
-                    # Publish event to REDIS
                     redis_client.publish(redis_channels.PAPER_TRADE_UPDATE, json.dumps(updated_dict))
                     
         except Exception as e:
             logger.error(f"Error checking targets for position {pos_id}: {e}")
+            
+            # Connection/retrieval failure tracking
+            now = time.time()
+            if bridge_fail_since is None:
+                bridge_fail_since = now
+            else:
+                elapsed = now - bridge_fail_since
+                if elapsed >= CRITICAL_ALERT_TIMEOUT_SEC:
+                    msg = f"MT5 Bridge is unreachable for active target monitoring. Failing consecutively for {int(elapsed/60)} minutes."
+                    logger.critical(msg)
+                    publish_error("paper_trader", "CRITICAL", msg, str(e))
 
 
 async def paper_trader_background_loop():
@@ -180,29 +204,40 @@ async def startup_event():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "status": "ok", 
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "bridge_fail_duration_seconds": 0 if bridge_fail_since is None else (time.time() - bridge_fail_since)
+    }
 
 
 @app.post("/signal")
 async def receive_signal(signal: TradeSignalInput):
     """
     Ingests TradeSignal events, pushes into the tracking DB, and publishes trade details.
+    Enforces kill-switch halts and idempotency.
     """
+    # 1. Check Kill-Switch
+    if is_kill_switch_active():
+        raise HTTPException(status_code=503, detail="Trading operations are currently halted by emergency kill switch.")
+
+    # 2. Check Idempotency (prevent duplicate trade execution)
+    payload = model_to_dict(signal)
+    pos_id = payload.get("signal_id") or f"pos_{int(time.time())}_{payload.get('instrument')}"
+    
+    existing = db.get_position(pos_id)
+    if existing:
+        logger.info(f"Signal ID {pos_id} already exists. Returning existing position state.")
+        return {"status": "exists", "position_id": pos_id, "data": existing}
+
     logger.info(f"Broker received signal: Instrument {signal.instrument}, Side {signal.direction}, Lots {signal.lots}")
     
     # Write into SQLite
-    payload = model_to_dict(signal)
     pos_id = db.open_position(payload)
     
     # Retrieve details inside dictionary structure
-    with db._get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM positions WHERE id = ?", (pos_id,))
-        row = cur.fetchone()
-        
-    pos_dict = {}
-    if row:
-        pos_dict = dict(row)
+    pos_dict = db.get_position(pos_id) or {}
+    if pos_dict:
         try:
             # Publish TRADE_OPENED event to Redis
             redis_client.publish(redis_channels.TRADE_OPENED, json.dumps(pos_dict))
@@ -234,18 +269,17 @@ async def get_running_stats():
 @app.post("/close/{trade_id}")
 async def manual_close_position(trade_id: str):
     """
-    Closes a position manually at the current close price.
+    Closes a position manually at the current close price. Handles idempotency.
     """
-    # Fetch details first
-    with db._get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM positions WHERE id = ? AND status = 'open'", (trade_id,))
-        row = cur.fetchone()
+    pos = db.get_position(trade_id)
+    if not pos:
+        raise HTTPException(status_code=404, detail=f"No position found matching id: {trade_id}")
         
-    if not row:
-        raise HTTPException(status_code=404, detail=f"No active open position found matching id: {trade_id}")
+    # Idempotent Close check
+    if pos["status"] == "closed":
+        logger.info(f"Position {trade_id} is already closed. Idempotency success.")
+        return {"status": "already_closed", "trade_id": trade_id, "close_price": pos["close_price"], "data": pos}
         
-    pos = dict(row)
     instrument = pos["instrument"]
     close_price = float(pos["entry_price"]) # default fallback
     
@@ -265,14 +299,8 @@ async def manual_close_position(trade_id: str):
     db.close_position(trade_id, close_price, reason="manual")
     
     # Retrieve updated row
-    with db._get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM positions WHERE id = ?", (trade_id,))
-        updated_row = cur.fetchone()
-        
-    updated_dict = {}
-    if updated_row:
-        updated_dict = dict(updated_row)
+    updated_dict = db.get_position(trade_id) or {}
+    if updated_dict:
         try:
             # Publish PAPER_TRADE_UPDATE to signify status changes
             redis_client.publish(redis_channels.PAPER_TRADE_UPDATE, json.dumps(updated_dict))
@@ -293,7 +321,6 @@ async def get_promotion_candidates():
     
     for sg in strategy_groups:
         wr = sg.get("win_rate", 0.0)
-        # Normalize in case win_rate is percentage (e.g. 52.0 vs 0.52)
         norm_wr = wr if wr <= 1.0 else (wr / 100.0)
         
         expectancy = sg.get("expectancy_r", 0.0)
@@ -304,6 +331,16 @@ async def get_promotion_candidates():
             candidates.append(sg)
             
     return candidates
+
+
+@app.post("/reset")
+async def reset_paper_trader():
+    """Resets paper trader database for a clean start."""
+    logger.warning("Paper trader database RESET requested!")
+    db.reset_db()
+    # Reset cached statistics
+    db.compute_stats()
+    return {"status": "reset", "message": "Paper trader database cleared and reset successfully."}
 
 
 if __name__ == "__main__":

@@ -151,6 +151,8 @@ services:
       dockerfile: Dockerfile
     container_name: hermes_execution
     command: python -m services.execution
+    ports:
+      - "5563:5563"   # FastAPI — /kill, /resume, /pending, /health
     volumes:
       - ./data:/data
     extra_hosts:
@@ -171,6 +173,7 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
+      - C:\Users\user\AppData\Local\hermes\obsidian:/data/obsidian:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
@@ -186,6 +189,8 @@ services:
     container_name: hermes_app
     ports:
       - "3000:3000"
+    volumes:
+      - C:\Users\user\AppData\Local\hermes\obsidian:/data/obsidian:ro
     env_file:
       - .env
     extra_hosts:

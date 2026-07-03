@@ -18,6 +18,7 @@ from services.shared.logger import get_logger
 from services.shared import redis_channels
 from services.shared.models import TradeSignal
 from services.shared.error_bus import publish_error
+from services.shared.kill_switch import is_kill_switch_active, activate_kill_switch, deactivate_kill_switch
 
 from services.execution.risk_gatekeeper import RiskGatekeeper
 from services.execution.signal_generator import SignalGenerator
@@ -26,7 +27,7 @@ from services.execution.chart_annotator import ChartAnnotator
 
 logger = get_logger("execution")
 
-app = FastAPI(title="Hermes Execution Engine", version="1.0")
+app = FastAPI(title="Hermes Execution Engine", version="1.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
@@ -88,11 +89,56 @@ async def process_and_route_signal(signal: TradeSignal) -> dict:
     instrument = signal.instrument
     logger.info(f"Processing signal {signal.signal_id} ({instrument} {signal.direction}) mode={mode}")
 
+    # 1. Check Kill-Switch
+    if is_kill_switch_active():
+        reason = "Trading halted due to active emergency kill switch."
+        logger.warning(f"Signal {signal.signal_id} REJECTED: {reason}")
+        signal.status = "rejected"
+        payload = signal.to_dict()
+        payload["status"] = "rejected"
+        append_signal_log(REJECTED_LOG_FILE, payload, {"reason": reason})
+        return {"status": "rejected", "reason": reason, "signal": payload}
+
+    # 2. Check Idempotency via Redis key lock
+    redis_key = f"hermes:processed_signals:{signal.signal_id}"
+    try:
+        # Check if already processed
+        existing_status = redis_client.get(redis_key)
+        if existing_status:
+            logger.info(f"Signal {signal.signal_id} already has processed status: {existing_status}. Returning cached state.")
+            return {
+                "status": "duplicate",
+                "reason": f"Signal {signal.signal_id} already processed (status: {existing_status})",
+                "signal": signal.to_dict()
+            }
+        # Set temporary lock
+        redis_client.set(redis_key, "processing", ex=300)
+    except Exception as e:
+        logger.error(f"Redis idempotency check failed: {e}")
+
+    # 3. Check optional human approval required setting
+    approval_required = os.getenv("APPROVAL_REQUIRED", "false").lower() == "true"
+    if approval_required and signal.status != "approved_by_user":
+        logger.info(f"Signal {signal.signal_id} held in queue awaiting manual approval.")
+        signal.status = "pending_approval"
+        payload = signal.to_dict()
+        payload["status"] = "pending_approval"
+        
+        try:
+            redis_client.set(f"hermes:pending_signals:{signal.signal_id}", json.dumps(payload), ex=86400)
+            redis_client.publish("hermes:signals:pending", json.dumps(payload))
+            redis_client.set(redis_key, "pending_approval", ex=86400)
+        except Exception as e:
+            logger.error(f"Failed to publish pending signal status: {e}")
+            
+        return {"status": "pending_approval", "reason": "User approval required", "signal": payload}
+
     # A. Account state
-    account_state = {"balance": 10000.0, "equity": 10000.0, "daily_dd_pct": 0.0, "weekly_dd_pct": 0.0}
+    account_state = {"balance": 10000.0, "equity": 10000.0, "daily_dd_pct": 0.0, "weekly_dd_pct": 0.0, "online": False}
     data = await _get("http://mt5_bridge:5558/account_state")
     if data:
         account_state.update(data)
+        account_state["online"] = True
 
     # B. Open positions
     open_positions = []
@@ -146,6 +192,9 @@ async def process_and_route_signal(signal: TradeSignal) -> dict:
                 "signal": payload, "route_status": route_status,
                 "route_detail": route_detail, "approved_at": datetime.utcnow().isoformat() + "Z"
             }))
+            redis_client.set(redis_key, "approved", ex=86400)
+            # Remove from pending queue if present
+            redis_client.delete(f"hermes:pending_signals:{signal.signal_id}")
         except Exception as e:
             logger.error(f"Redis publish APPROVED failed: {e}")
 
@@ -163,6 +212,9 @@ async def process_and_route_signal(signal: TradeSignal) -> dict:
                 "signal": payload, "reason": reason,
                 "rejected_at": datetime.utcnow().isoformat() + "Z"
             }))
+            redis_client.set(redis_key, "rejected", ex=86400)
+            # Remove from pending queue if present
+            redis_client.delete(f"hermes:pending_signals:{signal.signal_id}")
         except Exception as e:
             logger.error(f"Redis publish REJECTED failed: {e}")
 
@@ -202,7 +254,11 @@ async def startup_event():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "kill_switch_active": is_kill_switch_active()
+    }
 
 
 @app.post("/signal")
@@ -212,6 +268,117 @@ async def receive_signal_endpoint(data: Dict[str, Any]):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid signal format: {e}")
     return await process_and_route_signal(signal)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW ENDPOINTS FOR KILL SWITCH AND HUMAN APPROVAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/kill")
+async def trigger_emergency_kill(flatten: Optional[bool] = False):
+    """Triggers the emergency kill switch and optionally flattens all open positions."""
+    logger.critical("EMERGENCY KILL SWITCH TRIGGERED!")
+    activate_kill_switch()
+    
+    response = {
+        "status": "halted",
+        "kill_switch_active": True,
+        "positions_flattened": []
+    }
+    
+    if flatten:
+        # A. Flatten Paper Trader Positions
+        try:
+            paper_positions = await _get("http://paper_trader:5561/positions")
+            if isinstance(paper_positions, list):
+                for pos in paper_positions:
+                    pos_id = pos.get("id")
+                    if pos_id:
+                        await _post(f"http://paper_trader:5561/close/{pos_id}", {})
+                        response["positions_flattened"].append(f"paper_{pos_id}")
+        except Exception as e:
+            logger.error(f"Failed to flatten paper trades: {e}")
+            
+        # B. Flatten Live Positions
+        try:
+            live_positions = await _get("http://mt5_bridge:5558/positions")
+            if isinstance(live_positions, list):
+                for pos in live_positions:
+                    ticket = pos.get("ticket")
+                    symbol = pos.get("symbol")
+                    if ticket and symbol:
+                        # Call order router directly
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, lambda: order_router.send_close(ticket, symbol))
+                        response["positions_flattened"].append(f"live_{ticket}")
+        except Exception as e:
+            logger.error(f"Failed to flatten live trades: {e}")
+            
+    return response
+
+
+@app.post("/resume")
+async def resume_trading_activity():
+    """Deactivates the emergency kill switch and resumes trading."""
+    logger.info("Resuming trading operations from emergency halt.")
+    deactivate_kill_switch()
+    return {"status": "active", "kill_switch_active": False}
+
+
+@app.get("/pending_signals")
+async def get_pending_signals_list():
+    """Lists all signals awaiting manual user confirmation."""
+    keys = []
+    try:
+        keys = redis_client.keys("hermes:pending_signals:*")
+    except Exception:
+        pass
+    
+    pending = []
+    for k in keys:
+        try:
+            val = redis_client.get(k)
+            if val:
+                pending.append(json.loads(val))
+        except Exception:
+            pass
+    return pending
+
+
+@app.post("/signal/{signal_id}/approve")
+async def approve_pending_signal(signal_id: str):
+    """Confirm and execute a pending signal."""
+    redis_key = f"hermes:pending_signals:{signal_id}"
+    raw = redis_client.get(redis_key)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Signal not found in pending confirmation queue.")
+        
+    data = json.loads(raw)
+    data["status"] = "approved_by_user"
+    signal = TradeSignal.from_dict(data)
+    
+    # Process signal again (will bypass approval check and execute)
+    return await process_and_route_signal(signal)
+
+
+@app.post("/signal/{signal_id}/reject")
+async def reject_pending_signal(signal_id: str):
+    """Discard a pending signal."""
+    redis_key = f"hermes:pending_signals:{signal_id}"
+    raw = redis_client.get(redis_key)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Signal not found in pending confirmation queue.")
+        
+    data = json.loads(raw)
+    data["status"] = "rejected_by_user"
+    signal = TradeSignal.from_dict(data)
+    
+    logger.info(f"Signal {signal_id} rejected by user.")
+    redis_client.delete(redis_key)
+    redis_client.set(f"hermes:processed_signals:{signal_id}", "rejected_by_user", ex=86400)
+    
+    append_signal_log(REJECTED_LOG_FILE, signal.to_dict(), {"reason": "Rejected manually by user"})
+    return {"status": "rejected", "signal_id": signal_id}
 
 
 if __name__ == "__main__":

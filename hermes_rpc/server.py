@@ -8,6 +8,8 @@ import httpx
 from datetime import datetime, date
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +37,7 @@ app.add_middleware(
 
 # Configuration defaults for Windows Host execution environment
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-VAULT_ROOT  = os.getenv("OBSIDIAN_VAULT_ROOT", "C:\\Fahd data AI\\Fahd\\Vault")
+VAULT_ROOT  = os.getenv("OBSIDIAN_VAULT_ROOT", os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local")), "hermes", "obsidian"))
 
 # Discover the actual model names installed in Ollama at startup
 # rather than hardcoding names that may not match

@@ -17,6 +17,22 @@ class PaperTradeDB:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def get_position(self, pos_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single position by its unique ID."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM positions WHERE id = ?", (pos_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def reset_db(self):
+        """Drops all tables and recreates them clean."""
+        with self._get_conn() as conn:
+            conn.execute("DROP TABLE IF EXISTS positions")
+            conn.execute("DROP TABLE IF EXISTS stats_cache")
+            conn.commit()
+        self._init_db()
+
     def _init_db(self):
         """Initializes tables and performs necessary migration setup."""
         with self._get_conn() as conn:

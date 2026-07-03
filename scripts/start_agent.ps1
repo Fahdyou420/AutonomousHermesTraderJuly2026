@@ -1,4 +1,4 @@
-﻿# start_agent.ps1
+# start_agent.ps1
 # Launches the Hermes Autonomous Trading Agent.
 # Runs independently of MT5 - operates 24/7 on wall-clock time.
 # On weekends it uses yfinance for price data instead of MT5.
@@ -29,7 +29,7 @@ $env:MT5_BRIDGE_URL     = "http://localhost:5558"
 $env:PAPER_TRADER_URL   = "http://localhost:5561"
 $env:MCP_BRIDGE_URL     = "http://localhost:5562"
 $env:BACKTESTER_URL     = "http://localhost:5560"
-$env:OBSIDIAN_VAULT_ROOT = "C:\Fahd data AI\Fahd\Vault"
+$env:OBSIDIAN_VAULT_ROOT = "$env:LOCALAPPDATA\hermes\obsidian"
 
 Write-Host "[*] Ensuring yfinance is installed (weekend data fallback)..." -ForegroundColor Yellow
 pip install yfinance -q

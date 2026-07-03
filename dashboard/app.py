@@ -98,7 +98,7 @@ def system_status():
 @app.route('/api/market/price', methods=['GET'])
 def get_market_price():
     """Live price from MT5 bridge."""
-    data = _get(f"{MT5_BRIDGE_URL}/latest_bars?n=1", timeout=5)
+    data = _get(f"{MT5_BRIDGE_URL}/latest_bars?instrument=XAUUSD&tf=M15&n=1", timeout=5)
     if data and isinstance(data, list) and len(data) > 0:
         return jsonify({"price": data[-1].get("close", 0.0)})
     return jsonify({"price": 0.0})

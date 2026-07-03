@@ -15,9 +15,12 @@ logger = get_logger("risk_gatekeeper")
 class RiskGatekeeper:
     def __init__(self):
         self.mt5_bridge_url = os.getenv("MT5_BRIDGE_URL", "http://mt5_bridge:5558")
-        self.max_daily_dd = float(os.getenv("MAX_DAILY_DD_PCT", "4.0"))
-        self.max_weekly_dd = float(os.getenv("MAX_WEEKLY_DD_PCT", "8.0"))
+        # Support fallback between MAX_DAILY_DD and MAX_DAILY_DD_PCT
+        self.max_daily_dd = float(os.getenv("MAX_DAILY_DD", os.getenv("MAX_DAILY_DD_PCT", "3.0")))
+        # Support fallback between MAX_WEEKLY_DD and MAX_WEEKLY_DD_PCT
+        self.max_weekly_dd = float(os.getenv("MAX_WEEKLY_DD", os.getenv("MAX_WEEKLY_DD_PCT", "6.0")))
         self.max_spread_pips = float(os.getenv("MAX_SPREAD_PIPS", "25.0"))
+        self.max_risk_pct = float(os.getenv("MAX_RISK_PCT", "1.0"))
 
     def check(
         self, 
@@ -34,12 +37,21 @@ class RiskGatekeeper:
         instrument = signal.instrument if hasattr(signal, "instrument") else signal.get("instrument", "")
         direction = signal.direction if hasattr(signal, "direction") else signal.get("direction", "")
         entry_price = float(signal.entry_price if hasattr(signal, "entry_price") else signal.get("entry_price", 0.0))
+        sl = float(signal.sl if hasattr(signal, "sl") else signal.get("sl", 0.0))
         lots = float(signal.lots if hasattr(signal, "lots") else signal.get("lots", 0.0))
         mode = signal.mode if hasattr(signal, "mode") else signal.get("mode", "paper")
         confidence = (signal.confidence if hasattr(signal, "confidence") else signal.get("confidence", "medium")).lower()
         r_ratio = float(signal.r_ratio if hasattr(signal, "r_ratio") else signal.get("r_ratio", 0.0))
 
         logger.info(f"Checking Risk rules for TradeSignal direction: {direction} | Mode: {mode} | Sym: {instrument}")
+
+        # 0. Check account state availability (fail-safe block)
+        if not account_state.get("online", False):
+            # If paper trading, we can allow it as a fallback if balance is set, but warn. For live, strictly block.
+            if mode == "live":
+                return False, "Rule 0: Live trading halted because MT5 Bridge / account state is offline."
+            else:
+                logger.warning("MT5 Bridge offline. Proceeding with paper trade using baseline risk values.")
 
         # 1. Check Daily Drawdown
         daily_dd = float(account_state.get("daily_dd_pct", 0.0))
@@ -55,12 +67,20 @@ class RiskGatekeeper:
         if len(open_positions) >= 3:
             return False, f"Rule 3: Maximum open positions limit (3) exceeded. Active Open count: {len(open_positions)}"
 
-        # 4. Total trade value within 1% of account state balance limit
+        # 4. Total trade risk within MAX_RISK_PCT of account state balance limit
         balance = float(account_state.get("balance", 10000.0))
-        trade_val = lots * entry_price
-        max_allowed_val = balance * 0.01
-        if trade_val > max_allowed_val:
-            return False, f"Rule 4: Position value ({trade_val:.2f}) exceeds 1% of total account balance limit ({max_allowed_val:.2f})"
+        risk_distance = abs(entry_price - sl)
+        if risk_distance <= 0:
+            # Fall back to notional trade value if SL is not set or equal to entry
+            trade_risk = lots * entry_price
+            logger.warning(f"Stop Loss is 0 or equal to entry. Risk checked as notional position value: {trade_risk:.2f}")
+        else:
+            # Risk cash value = lots * distance
+            trade_risk = lots * risk_distance
+
+        max_allowed_risk = balance * (self.max_risk_pct / 100.0)
+        if trade_risk > max_allowed_risk:
+            return False, f"Rule 4: Position risk value (${trade_risk:.2f}) exceeds {self.max_risk_pct}% of total account balance limit (${max_allowed_risk:.2f})"
 
         # 5. Check macroeconomic calendar impact schedule (within ± 15 mins)
         now_ts = int(time.time())
@@ -89,12 +109,18 @@ class RiskGatekeeper:
                 if bars_res:
                     latest_bar = bars_res[-1]
                     spread_points = int(latest_bar.get("spread", 0))
-                    # Conver points to standard pips (1 pip = 10 broker points)
+                    # Convert points to standard pips (1 pip = 10 broker points)
                     spread_pips = spread_points / 10.0
                     if spread_pips > self.max_spread_pips:
                         return False, f"Rule 8: Active market spread of {spread_pips} pips exceeds max protective gate: {self.max_spread_pips} pips"
+            else:
+                if mode == "live":
+                    return False, f"Rule 8: Live trade blocked because MT5 Bridge returned status {resp.status_code} for spread check."
         except Exception as e:
-            logger.warning(f"Skipping MT5 spread verification due to retrieval error: {e}")
+            if mode == "live":
+                return False, f"Rule 8: Live trade blocked because MT5 spread verification failed: {e}"
+            logger.warning(f"Skipping MT5 spread verification for paper/test due to retrieval error: {e}")
 
         logger.info("✓ All risk qualification criteria passed successfully. Approving Trade Candidate.")
         return True, "approved"
+

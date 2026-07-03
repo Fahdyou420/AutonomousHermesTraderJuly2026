@@ -35,7 +35,7 @@ MT5_URL        = os.getenv("MT5_BRIDGE_URL",    "http://localhost:5558")
 PAPER_URL      = os.getenv("PAPER_TRADER_URL",  "http://localhost:5561")
 BACKTEST_URL   = os.getenv("BACKTESTER_URL",    "http://localhost:5560")
 MCP_URL        = os.getenv("MCP_BRIDGE_URL",    "http://localhost:5562")
-VAULT_ROOT     = os.getenv("OBSIDIAN_VAULT_ROOT","C:\\Fahd data AI\\Fahd\\Vault")
+VAULT_ROOT     = os.getenv("OBSIDIAN_VAULT_ROOT", os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local")), "hermes", "obsidian"))
 
 INSTRUMENT     = os.getenv("HERMES_INSTRUMENT", "XAUUSD")
 TIMEFRAME      = os.getenv("HERMES_TIMEFRAME",  "M15")
