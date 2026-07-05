@@ -30,12 +30,25 @@ logging.basicConfig(
 log = logging.getLogger("hermes_agent")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OLLAMA_URL     = os.getenv("OLLAMA_URL",        "http://localhost:11434")
-MT5_URL        = os.getenv("MT5_BRIDGE_URL",    "http://localhost:5558")
-PAPER_URL      = os.getenv("PAPER_TRADER_URL",  "http://localhost:5561")
-BACKTEST_URL   = os.getenv("BACKTESTER_URL",    "http://localhost:5560")
-MCP_URL        = os.getenv("MCP_BRIDGE_URL",    "http://localhost:5562")
-VAULT_ROOT     = os.getenv("OBSIDIAN_VAULT_ROOT","C:\\Fahd data AI\\Fahd\\Vault")
+from dotenv import load_dotenv
+load_dotenv(override=True)  # override=True ensures .env wins over any stale system/user env vars
+def _local_url(url: str) -> str:
+    import re
+    return re.sub(r'http://([a-zA-Z0-9_]+):', r'http://localhost:', url)
+
+OLLAMA_URL     = _local_url(os.getenv("OLLAMA_URL",        "http://localhost:11434"))
+MT5_URL        = _local_url(os.getenv("MT5_BRIDGE_URL",    "http://localhost:5558"))
+PAPER_URL      = _local_url(os.getenv("PAPER_TRADER_URL",  "http://localhost:5561"))
+BACKTEST_URL   = _local_url(os.getenv("BACKTESTER_URL",    "http://localhost:5560"))
+MCP_URL        = _local_url(os.getenv("MCP_BRIDGE_URL",    "http://localhost:5562"))
+VAULT_ROOT     = os.getenv("OBSIDIAN_VAULT_ROOT", os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local")), "hermes", "obsidian"))
+
+# ── LLM Fallback Chain: Nous Portal → Gemini → Ollama ────────────────────────
+NOUS_API_KEY   = os.getenv("NOUS_API_KEY", "")
+NOUS_MODEL     = os.getenv("NOUS_MODEL", "stepfun/step-3.7-flash:free")
+NOUS_BASE_URL  = "https://inference-api.nousresearch.com/v1"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash"
 
 INSTRUMENT     = os.getenv("HERMES_INSTRUMENT", "XAUUSD")
 TIMEFRAME      = os.getenv("HERMES_TIMEFRAME",  "M15")
@@ -79,20 +92,61 @@ def discover_model() -> str:
                 return models[0]
     except Exception as e:
         log.error(f"Ollama model discovery failed: {e}")
-    return "llama3.2"
+    return "hermes3:latest"
 
+
+# ── LLM call with Nous → Gemini → Ollama fallback chain ─────────────────────
 
 def ask(prompt: str, system: str = None, timeout: int = 180) -> str:
     """
-    Call Ollama directly. Returns the full response text.
-    No streaming — simpler, more reliable for an automated agent.
+    Call LLM with Nous Portal → Gemini → Ollama fallback chain.
+    Returns the full response text.
     """
-    model = state["model"] or "llama3.2"
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # Tier 1: Nous Portal
+    if NOUS_API_KEY:
+        try:
+            r = requests.post(
+                f"{NOUS_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {NOUS_API_KEY}", "Content-Type": "application/json"},
+                json={"model": NOUS_MODEL, "messages": messages, "stream": False},
+                timeout=timeout,
+            )
+            if r.status_code == 200:
+                text = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if text:
+                    log.info(f"[LLM] Nous Portal ({NOUS_MODEL}) responded successfully")
+                    return text
+            log.warning(f"[LLM] Nous Portal failed ({r.status_code}), trying Gemini...")
+        except Exception as e:
+            log.warning(f"[LLM] Nous Portal exception: {e}, trying Gemini...")
+
+    # Tier 2: Gemini
+    if GEMINI_API_KEY:
+        try:
+            gemini_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            )
+            gemini_messages = [{"role": m["role"] if m["role"] != "system" else "user",
+                                "parts": [{"text": m["content"]}]} for m in messages]
+            r = requests.post(gemini_url, json={"contents": gemini_messages}, timeout=60)
+            if r.status_code == 200:
+                data = r.json()
+                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                if text:
+                    log.info(f"[LLM] Gemini ({GEMINI_MODEL}) responded successfully")
+                    return text
+            log.warning(f"[LLM] Gemini failed ({r.status_code}), falling back to Ollama...")
+        except Exception as e:
+            log.warning(f"[LLM] Gemini exception: {e}, falling back to Ollama...")
+
+    # Tier 3: Ollama (local fallback)
+    model = state.get("model") or discover_model()
     try:
         r = requests.post(
             f"{OLLAMA_URL}/api/chat",
@@ -101,11 +155,11 @@ def ask(prompt: str, system: str = None, timeout: int = 180) -> str:
         )
         if r.status_code == 200:
             return r.json().get("message", {}).get("content", "").strip()
-        log.error(f"Ollama {r.status_code}: {r.text[:300]}")
+        log.error(f"[LLM] Ollama {r.status_code}: {r.text[:300]}")
     except requests.exceptions.Timeout:
-        log.error(f"Ollama timed out after {timeout}s")
+        log.error(f"[LLM] Ollama timed out after {timeout}s")
     except Exception as e:
-        log.error(f"Ollama call failed: {e}")
+        log.error(f"[LLM] Ollama call failed: {e}")
     return ""
 
 
@@ -553,10 +607,30 @@ Output exactly this JSON structure, no other text:
         result = post(f"{MCP_URL}/signal", signal, timeout=15)
         if result:
             log.info(f"[PAPER] Signal sent: {signal['direction']} {signal.get('lots')} lots @ {signal.get('entry_price')}")
+            
+            # Format execution verdict
+            verdict = result.get("status", "unknown")
+            reason = result.get("reason", "none provided")
+            
+            # Write structured decision log
             write_vault(
-                f"03_TRADE_JOURNAL/paper/{date_str()}_trade_{state['cycle']:04d}.md",
-                f"## Paper Trade Signal\n\n```json\n{json.dumps(signal, indent=2)}\n```\n\n## Research Basis\n\n{research[:800]}",
-                {"type": "paper_trade", "direction": signal["direction"]}
+                f"03_TRADE_JOURNAL/decisions/{date_str()}_{signal['signal_id']}_decision.md",
+                f"# Trade Decision: {signal['signal_id']}\n\n"
+                f"**Timestamp**: {datetime.utcnow().isoformat()}Z\n"
+                f"**Instrument**: {signal['instrument']} | **Session**: {signal['session']}\n\n"
+                f"## 1. Execution Verdict\n"
+                f"- **Status**: `{verdict}`\n"
+                f"- **Reason**: {reason}\n\n"
+                f"## 2. Signal Parameters\n"
+                f"```json\n{json.dumps(signal, indent=2)}\n```\n\n"
+                f"## 3. Context & Reasoning\n"
+                f"### LLM Thoughts / Agent Notes\n"
+                f"> {signal.get('agent_notes', 'No notes provided.')}\n\n"
+                f"### Research Basis\n"
+                f"{research}\n\n"
+                f"### Prompt Reference\n"
+                f"```text\n{prompt}\n```",
+                {"type": "decision_log", "direction": signal["direction"], "verdict": verdict}
             )
         else:
             log.warning("[PAPER] Signal POST returned no response.")
@@ -693,17 +767,39 @@ Keep it brief — this is a startup check, not a full scan."""
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def wait_for_ollama(max_wait: int = 120) -> bool:
-    log.info(f"Waiting for Ollama at {OLLAMA_URL}...")
+def _check_nous() -> bool:
+    """Return True if Nous Portal API key is configured and the endpoint responds."""
+    if not NOUS_API_KEY:
+        return False
+    try:
+        r = requests.get(f"{NOUS_BASE_URL}/models",
+                         headers={"Authorization": f"Bearer {NOUS_API_KEY}"}, timeout=5)
+        return r.status_code in (200, 404)  # 404 still means auth worked
+    except Exception:
+        return False
+
+
+def _check_ollama() -> bool:
+    """Return True if local Ollama is reachable."""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        return r.ok
+    except Exception:
+        return False
+
+
+def wait_for_llm(max_wait: int = 120) -> bool:
+    """Wait until at least one LLM provider (Nous or Ollama) is reachable."""
+    log.info(f"Checking LLM providers (Nous→Gemini→Ollama)...")
     for i in range(max_wait):
-        try:
-            r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-            if r.ok:
-                models = [m["name"] for m in r.json().get("models", [])]
-                log.info(f"Ollama ready. Models: {models}")
-                return True
-        except Exception:
-            pass
+        if _check_nous():
+            log.info(f"[LLM] Nous Portal available ({NOUS_MODEL})")
+            return True
+        if _check_ollama():
+            log.info(f"[LLM] Ollama available at {OLLAMA_URL}")
+            return True
+        if i % 10 == 0:
+            log.info(f"Waiting for LLM provider... ({i}s elapsed)")
         time.sleep(1)
     return False
 
@@ -714,14 +810,30 @@ def main():
     log.info(f"  Instrument : {INSTRUMENT} {TIMEFRAME}")
     log.info(f"  Mode       : {PAPER_MODE} | Risk: {MAX_RISK_PCT}% | DD halt: {MAX_DAILY_DD}%")
     log.info(f"  Scan: {SCAN_INTERVAL_MIN}min | Research: {RESEARCH_INTERVAL_HR}hr | Review: {REVIEW_INTERVAL_HR}hr")
+    log.info(f"  LLM Chain  : Nous Portal ({NOUS_MODEL}) → Gemini → Ollama")
     log.info("=" * 60)
 
-    if not wait_for_ollama():
-        log.error("Ollama unreachable. Is it running? Run: ollama serve")
+    if not wait_for_llm():
+        log.error("No LLM providers reachable (Nous/Gemini/Ollama). Cannot start.")
         sys.exit(1)
 
-    state["model"] = discover_model()
-    log.info(f"Using model: {state['model']}")
+    # Discover Ollama model (used as tier-3 fallback)
+    state["model"] = None
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        if r.ok:
+            models = [m["name"] for m in r.json().get("models", [])]
+            for kw in ["hermes", "llama3.1", "llama3", "mistral", "qwen"]:
+                for m in models:
+                    if kw in m.lower():
+                        state["model"] = m
+                        break
+                if state["model"]: break
+            if not state["model"] and models:
+                state["model"] = models[0]
+    except Exception:
+        pass
+    log.info(f"Ollama fallback model: {state['model'] or 'N/A (Nous/Gemini will be used)'}")
 
     # Install yfinance if not present (weekend data fallback)
     try:

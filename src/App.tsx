@@ -14,12 +14,14 @@ import KnowledgeExplorer from './components/KnowledgeExplorer';
 import StrategyStudio from './components/StrategyStudio';
 import TradeMonitor from './components/TradeMonitor';
 import AutonomousLoops from './components/AutonomousLoops';
-import { Terminal, LineChart, Cpu, BookOpen, Settings2, Shield, Activity, RefreshCw } from 'lucide-react';
+import LogConsole from './components/LogConsole';
+import { Terminal, LineChart, Cpu, BookOpen, Settings2, Shield, Activity, RefreshCw, Layers } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'terminal' | 'trades' | 'strategies' | 'vault' | 'loops'>('terminal');
+  const [activeTab, setActiveTab] = useState<'terminal' | 'trades' | 'strategies' | 'vault' | 'loops' | 'logs'>('terminal');
   
   // App states
+  const [llmStatus, setLlmStatus] = useState<{tier: string, model: string}>({tier: 'none', model: 'none'});
   const [status, setStatus] = useState<SystemStatus>({
     ollama: 'disconnected',
     hermesRpc: 'disconnected',
@@ -68,18 +70,19 @@ export default function App() {
   // Load backend telemetry data
   const fetchAllData = async () => {
     try {
-      const [resStatus, resMarket, resTrades, resLogs, resVault, resSkills, resLoops, resStrategies] = await Promise.all([
+      const [resStatus, resMarket, resTrades, resVault, resSkills, resLoops, resStrategies, resLlmStatus] = await Promise.all([
         fetch('/api/status').then(r => r.json()),
         fetch('/api/market').then(r => r.json()),
         fetch('/api/trades').then(r => r.json()),
-        fetch('/api/logs').then(r => r.json()),
         fetch('/api/vault').then(r => r.json()),
         fetch('/api/skills').then(r => r.json()),
         fetch('/api/loops').then(r => r.json()),
-        fetch('/api/strategy/list').then(r => r.json()).catch(() => [])
+        fetch('/api/strategy/list').then(r => r.json()).catch(() => []),
+        fetch('/api/llm/status').then(r => r.json())
       ]);
 
       setStatus(resStatus);
+      setLlmStatus(resLlmStatus);
       setMarketMetrics({
         ...resMarket,
         currentPrice: resMarket.currentPrice || 0,
@@ -94,7 +97,6 @@ export default function App() {
       setDailyDD(resTrades.dailyDDPercent || 0);
       setWeeklyDD(resTrades.weeklyDDPercent || 0);
 
-      setLogs(resLogs);
       setNotes(resVault);
       setSkills(resSkills);
       setLoops(resLoops);
@@ -122,8 +124,26 @@ export default function App() {
 
   useEffect(() => {
     fetchAllData();
-    const interval = setInterval(fetchAllData, 3000);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchAllData, 15000);
+    
+    // SSE for Live Logs
+    const evtSource = new EventSource("/api/logs/stream");
+    evtSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.event === "connected") return;
+        setLogs(prev => {
+          const newLogs = [...prev, data];
+          if (newLogs.length > 200) newLogs.shift();
+          return newLogs;
+        });
+      } catch (err) {}
+    };
+
+    return () => {
+      clearInterval(interval);
+      evtSource.close();
+    };
   }, []);
 
   const handleRefreshStatus = async () => {
@@ -230,6 +250,19 @@ export default function App() {
           </div>
 
           <div id="header-right-side" className="flex flex-wrap items-center gap-6">
+            {/* LLM Status Badge */}
+            <div className="flex items-center space-x-2 px-3 py-1 bg-slate-900/60 border border-white/10 rounded-full font-mono text-[10px]">
+              <span className="text-slate-500">LLM:</span>
+              <div className={`w-2 h-2 rounded-full ${
+                llmStatus.tier === 'nous' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' :
+                llmStatus.tier === 'gemini' ? 'bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)]' :
+                llmStatus.tier === 'ollama' ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]' :
+                'bg-gray-500'
+              }`}></div>
+              <span className="text-slate-300 font-bold uppercase">{llmStatus.tier !== 'none' ? llmStatus.tier : 'OFFLINE'}</span>
+              <span className="text-slate-500">({llmStatus.model})</span>
+            </div>
+
             {/* Quick Metrics display */}
             <div id="ticker-metrics-strip" className="flex items-center gap-4 text-[10px] font-mono select-text bg-slate-900/30 border border-white/5 py-1.5 px-3 rounded">
               <div>
@@ -341,12 +374,29 @@ export default function App() {
             <Cpu className="w-3.5 h-3.5" />
             <span>AUTONOMOUS LOOPS</span>
           </button>
+
+          <button
+            id="tab-btn-logs"
+            onClick={() => setActiveTab('logs')}
+            className={`flex items-center space-x-2 py-2 px-4 rounded font-mono text-[11px] font-semibold tracking-wider cursor-pointer transition-all ${
+              activeTab === 'logs' 
+                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-[0_0_12px_rgba(6,182,212,0.15)] font-bold' 
+                : 'bg-slate-900/20 text-slate-450 border border-white/5 hover:text-slate-200 hover:bg-slate-900/40'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span>SYSTEM LOGS</span>
+          </button>
         </div>
 
         {/* Dynamic Display Board mapping */}
         <div id="display-workspace">
           {activeTab === 'terminal' && (
             <AgentTerminal logs={logs} onAddLog={handleAddLogMessage} />
+          )}
+
+          {activeTab === 'logs' && (
+            <LogConsole logs={logs} />
           )}
 
           {activeTab === 'trades' && (

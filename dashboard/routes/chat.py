@@ -6,10 +6,18 @@ chat_bp = Blueprint('chat', __name__)
 HERMES_RPC_URL = os.getenv("HERMES_RPC_URL", "http://host.docker.internal:7778")
 OLLAMA_URL     = os.getenv("OLLAMA_URL",      "http://host.docker.internal:11434")
 REDIS_URL      = os.getenv("REDIS_URL",       "redis://redis:6379")
+# LLM fallback chain: hermes_rpc (Nous→Gemini→Ollama) → direct Nous → direct Ollama
+NOUS_API_KEY   = os.getenv("NOUS_API_KEY", "")
+NOUS_MODEL     = os.getenv("NOUS_MODEL", "stepfun/step-3.7-flash:free")
+NOUS_BASE_URL  = "https://inference-api.nousresearch.com/v1"
 
 SYSTEM_PROMPT = """You are Hermes, an autonomous SMC/ICT trading agent for XAUUSD and BTCUSD.
 Use Smart Money Concepts: BOS, CHoCH, Order Blocks, FVGs, liquidity sweeps.
-Be precise with price levels. Max 1% risk per trade. Staged trust: hypothesis->backtest->paper->live."""
+Be precise with price levels. Max 1% risk per trade. Staged trust: hypothesis->backtest->paper->live.
+CRITICAL INSTRUCTION: You MUST use tools to fetch real prices before answering ANY market or price-related questions. 
+Do NOT guess or use your training data for current prices.
+To use a tool, you must output exactly this format and wait for the response:
+[TOOL: read_market_bars] {"instrument": "XAUUSD", "timeframe": "M15", "n": 1} [/TOOL]"""
 
 
 def _discover_model():
@@ -24,7 +32,7 @@ def _discover_model():
             if models: return models[0]
     except Exception:
         pass
-    return "llama3.2"
+    return "hermes3:latest"
 
 
 def _save_history(role, content):
@@ -65,10 +73,41 @@ def _stream_rpc(message, history):
         if accumulated.strip(): _save_history("assistant", accumulated)
         yield f"data: {json.dumps({'type':'done','content':''})}\n\n"
     except requests.exceptions.ConnectionError:
-        yield from _stream_ollama_direct(message, history)
+        yield from _stream_nous_direct(message, history)
     except Exception as e:
         yield f"data: {json.dumps({'type':'token','content':f'Error: {e}'})}\n\n"
         yield f"data: {json.dumps({'type':'done','content':''})}\n\n"
+
+
+def _stream_nous_direct(message, history):
+    """Tier-2 fallback: direct Nous Portal call when hermes_rpc is unavailable."""
+    if not NOUS_API_KEY:
+        yield from _stream_ollama_direct(message, history)
+        return
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for h in history[-10:]:
+        messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
+    messages.append({"role": "user", "content": message})
+
+    try:
+        r = requests.post(
+            f"{NOUS_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {NOUS_API_KEY}", "Content-Type": "application/json"},
+            json={"model": NOUS_MODEL, "messages": messages, "stream": False},
+            timeout=120,
+        )
+        if r.status_code == 200:
+            text = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if text:
+                _save_history("assistant", text)
+                yield f"data: {json.dumps({'type':'token','content':text})}\n\n"
+                yield f"data: {json.dumps({'type':'done','content':''})}\n\n"
+                return
+    except Exception:
+        pass
+    # Nous failed — fall through to Ollama
+    yield from _stream_ollama_direct(message, history)
 
 
 def _stream_ollama_direct(message, history):
@@ -131,11 +170,16 @@ def get_history():
 
 @chat_bp.route('/models', methods=['GET'])
 def get_models():
+    ollama_models = []
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
         if r.ok:
-            models = [m["name"] for m in r.json().get("models", [])]
-            return jsonify({"models": models, "selected": _discover_model()})
-    except Exception as e:
-        return jsonify({"error": str(e), "models": []}), 503
-    return jsonify({"models": [], "selected": ""})
+            ollama_models = [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        pass
+    return jsonify({
+        "llm_chain": ["hermes_rpc (Nous→Gemini→Ollama)", "direct-Nous", "direct-Ollama"],
+        "active_model": NOUS_MODEL if NOUS_API_KEY else _discover_model(),
+        "nous": {"model": NOUS_MODEL, "configured": bool(NOUS_API_KEY)},
+        "ollama": {"models": ollama_models, "selected": _discover_model()},
+    })

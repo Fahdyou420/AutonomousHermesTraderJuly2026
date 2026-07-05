@@ -1,0 +1,11 @@
+﻿# Runtime data files - not source code
+data/market_data/live_feed.jsonl
+data/trades/paper_trades.db
+data/trades/approved_signals.jsonl
+data/trades/rejected_signals.jsonl
+data/trades/draw_registry.json
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+hermes_rpc/__pycache__/

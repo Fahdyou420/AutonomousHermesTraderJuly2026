@@ -13,19 +13,59 @@ mcp_servers:
 Run with: python hermes_mcp_server.py
 Or:       powershell -File scripts/start_mcp_server.ps1
 """
-import os, json, requests
+import os, json, requests, logging
 from datetime import datetime
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+load_dotenv(override=True)  # override=True ensures .env wins over stale system/user env vars
 import uvicorn
 
-app = FastAPI(title="Hermes Trading MCP Server", version="1.0")
+app = FastAPI(title="Hermes Trading MCP Server", version="1.1")
 
-MT5_URL     = os.getenv("MT5_BRIDGE_URL",   "http://localhost:5558")
-PAPER_URL   = os.getenv("PAPER_TRADER_URL", "http://localhost:5561")
-PREPROC_URL = os.getenv("PREPROCESSOR_URL", "http://localhost:5559")
-BACKTEST_URL= os.getenv("BACKTESTER_URL",   "http://localhost:5560")
-MCP_URL     = os.getenv("MCP_BRIDGE_URL",   "http://localhost:5562")
+# ── Full configuration surface — every knob overridable via .env ─────────────
+# When running natively on the Windows host, internal Docker DNS (e.g. mt5_bridge) 
+# won't resolve. We map them to localhost where the ports are published.
+def _local_url(url: str) -> str:
+    import re
+    return re.sub(r'http://([a-zA-Z0-9_]+):', r'http://localhost:', url)
+
+MT5_URL     = _local_url(os.getenv("MT5_BRIDGE_URL",   "http://localhost:5558"))
+PAPER_URL   = _local_url(os.getenv("PAPER_TRADER_URL", "http://localhost:5561"))
+PREPROC_URL = _local_url(os.getenv("PREPROCESSOR_URL", "http://localhost:5559"))
+BACKTEST_URL= _local_url(os.getenv("BACKTESTER_URL",   "http://localhost:5560"))
+MCP_URL     = _local_url(os.getenv("MCP_BRIDGE_URL",   "http://localhost:5562"))
+
+# Where Hermes Desktop looks for its own config — used so skills created via
+# natural language land exactly where Hermes Desktop will find them.
+HERMES_HOME_DIR   = Path(os.getenv("HERMES_HOME_DIR",   str(Path.home() / ".hermes")))
+HERMES_SKILLS_DIR = Path(os.getenv("HERMES_SKILLS_DIR",  str(HERMES_HOME_DIR / "skills" / "trading")))
+OBSIDIAN_VAULT_ROOT = os.getenv("OBSIDIAN_VAULT_ROOT", str(Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "hermes" / "obsidian"))
+
+# Default risk parameters — every trade signal is validated against these
+# unless overridden by the agent per-call. Central place to tune risk posture.
+DEFAULT_MAX_RISK_PCT   = float(os.getenv("MAX_RISK_PCT", "1.0"))
+DEFAULT_MAX_DAILY_DD   = float(os.getenv("MAX_DAILY_DD", "3.0"))
+DEFAULT_INSTRUMENT     = os.getenv("HERMES_INSTRUMENT", "XAUUSD")
+DEFAULT_MTF_LIST       = os.getenv("HERMES_MTF_LIST", "M5,M15,H1,H4,D1").split(",")
+
+LOG_LEVEL = os.getenv("MCP_LOG_LEVEL", "INFO").upper()
+LOG_DIR   = Path(os.getenv("HERMES_LOG_DIR", str(Path.home() / "HermesLogs")))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [MCP] %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "mcp_server.log", encoding="utf-8")
+    ]
+)
+log = logging.getLogger("hermes_mcp")
+log.info(f"Config loaded — vault: {OBSIDIAN_VAULT_ROOT} | skills: {HERMES_SKILLS_DIR} | "
+         f"risk: {DEFAULT_MAX_RISK_PCT}% | dd_halt: {DEFAULT_MAX_DAILY_DD}% | "
+         f"instrument: {DEFAULT_INSTRUMENT} | mtf: {DEFAULT_MTF_LIST}")
 
 
 def _get(url, timeout=5):
@@ -51,6 +91,15 @@ TOOLS = [
          "instrument": {"type": "string", "default": "XAUUSD", "description": "XAUUSD, BTCUSD, EURUSD etc"},
          "timeframe":  {"type": "string", "default": "M15", "description": "M1 M5 M15 M30 H1 H4 D1"},
          "n":          {"type": "integer", "default": 200}}}},
+
+    {"name": "get_market_bars_mtf",
+     "description": "Get OHLCV bars across MULTIPLE timeframes in a single call for true multi-timeframe analysis (e.g. HTF bias on H4/D1, LTF entry on M5/M15). Returns a dict keyed by timeframe. The EA maintains a live multi-timeframe bundle (M5/M15/H1/H4/D1) refreshed automatically, independent of which chart it's attached to.",
+     "inputSchema": {"type": "object", "properties": {
+         "instrument": {"type": "string", "default": "XAUUSD"},
+         "timeframes": {"type": "array", "items": {"type": "string"},
+                        "default": ["M15", "H1", "H4", "D1"],
+                        "description": "List of timeframes to fetch, e.g. ['M15','H1','H4','D1']"},
+         "n":          {"type": "integer", "default": 200, "description": "Bars per timeframe"}}}},
 
     {"name": "get_account_state",
      "description": "Current account balance, equity, margin, profit from MT5.",
@@ -164,6 +213,29 @@ TOOLS = [
                                "default": ["london", "newyork", "overlap"],
                                "description": "Sessions to trade: asian, london, newyork, overlap"}}}}
     ,
+    {"name": "create_hermes_skill",
+     "description": "Create a new Hermes Desktop skill from a natural-language trading strategy description. Writes a proper skill markdown file directly to ~/.hermes/skills/ so it becomes immediately callable (e.g. '/skill my_new_strategy'). Use this whenever the person describes a new strategy or trading behavior in plain English — turn it into a durable, reusable skill rather than a one-off analysis. Pair with create_strategy to also give the skill a backtestable Python implementation.",
+     "inputSchema": {"type": "object", "required": ["skill_name", "description", "steps"],
+         "properties": {
+             "skill_name": {"type": "string", "description": "snake_case unique name, e.g. 'asian_range_breakout'"},
+             "description": {"type": "string", "description": "One-line summary of what the skill does"},
+             "steps": {"type": "string", "description": "Full step-by-step markdown body describing exactly what the agent should do when this skill runs — data to fetch, conditions to check, tools to call, decisions to make. Write this as clear numbered instructions, the same way you'd write any other Hermes skill."},
+             "tags": {"type": "array", "items": {"type": "string"}, "default": ["trading", "custom"]},
+             "linked_strategy": {"type": "string", "description": "Optional: name of a backtester strategy (from create_strategy) this skill should reference for backtesting/verdict logic"}}}},
+
+    {"name": "list_hermes_skills",
+     "description": "List all skills currently installed in ~/.hermes/skills/, including ones created via natural language and the built-in smc_trading_cycle skill.",
+     "inputSchema": {"type": "object", "properties": {}}},
+
+    {"name": "delete_hermes_skill",
+     "description": "Delete a skill file from ~/.hermes/skills/ by name.",
+     "inputSchema": {"type": "object", "required": ["skill_name"],
+         "properties": {"skill_name": {"type": "string"}}}},
+
+    {"name": "get_hermes_config",
+     "description": "Return the current full configuration: models, vault path, skills path, log path, risk parameters, default instrument, and MTF list. Use this to check or report current settings before changing anything.",
+     "inputSchema": {"type": "object", "properties": {}}},
+
     {"name": "list_strategies",
      "description": "List all available backtest strategies: built-in SMC strategies plus any custom ones the agent has created. Shows name, description, valid sessions, and source.",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -205,10 +277,15 @@ def _yfinance_bars(instrument, timeframe, n):
         return {"error": f"No yfinance data for {ticker}"}
     bars = []
     for ts, row in df.tail(n).iterrows():
+        def _scalar(v):
+            try:
+                return float(v)
+            except Exception:
+                return float(v.iloc[0])
         bars.append({"timestamp": int(ts.timestamp()), "instrument": instrument,
-                     "timeframe": timeframe, "open": float(row["Open"]),
-                     "high": float(row["High"]), "low": float(row["Low"]),
-                     "close": float(row["Close"]), "volume": int(row.get("Volume", 0)),
+                     "timeframe": timeframe, "open": _scalar(row["Open"]),
+                     "high": _scalar(row["High"]), "low": _scalar(row["Low"]),
+                     "close": _scalar(row["Close"]), "volume": int(_scalar(row.get("Volume", 0))),
                      "source": "yfinance"})
     return bars
 
@@ -227,6 +304,15 @@ def handle_tool(name, args):
             return {"error": "MT5 offline and yfinance not installed. Run: pip install yfinance"}
         except Exception as e:
             return {"error": f"Both MT5 and yfinance failed: {e}"}
+
+    elif name == "get_market_bars_mtf":
+        instr = args.get("instrument", DEFAULT_INSTRUMENT)
+        tfs   = args.get("timeframes", ["M15", "H1", "H4", "D1"])
+        n     = int(args.get("n", 200))
+        result = {}
+        for tf in tfs:
+            result[tf] = handle_tool("get_market_bars", {"instrument": instr, "timeframe": tf, "n": n})
+        return result
 
     elif name == "get_account_state":
         return _get(f"{MT5_URL}/account_state")
@@ -267,7 +353,9 @@ def handle_tool(name, args):
         return _post(f"{PAPER_URL}/close/{args.get('ticket')}", {})
 
     elif name == "run_backtest":
-        return _post(f"{BACKTEST_URL}/run", {
+        return _post(f"{BACKTEST_URL}/backtest", {
+            "strategy_id":   args.get("strategy_id", f"bt_{int(datetime.utcnow().timestamp())}"),
+            "name":          args.get("name", "Manual Backtest"),
             "instrument":    args.get("instrument", "XAUUSD"),
             "timeframe":     args.get("timeframe", "M15"),
             "strategy_type": args.get("strategy_type", "smc_ob_entry"),
@@ -682,6 +770,128 @@ class MyCustomSMCStrategy(BaseStrategy):
 '''
         return {"template_type": template_type, "code": code,
                 "instructions": "Fill in your logic, change the 'name' attribute to something unique, then call create_strategy with this code."}
+
+    elif name == "create_hermes_skill":
+        skill_name  = args.get("skill_name", "").strip()
+        description = args.get("description", "").strip()
+        steps       = args.get("steps", "").strip()
+        tags        = args.get("tags", ["trading", "custom"])
+        linked      = args.get("linked_strategy", "")
+
+        if not skill_name or not steps:
+            return {"error": "'skill_name' and 'steps' are required"}
+
+        safe_name = "".join(c if c.isalnum() or c == "_" else "_" for c in skill_name)
+
+        linked_block = ""
+        if linked:
+            linked_block = (f"\n## Linked Backtest Strategy\n\n"
+                           f"This skill's setups should be validated with `run_full_backtest` "
+                           f"using `strategy_type: \"{linked}\"` before any live paper trade signal "
+                           f"is sent. Require win rate > 52% and profit factor > 1.3 before acting.\n")
+
+        content = f"""---
+name: {safe_name}
+description: {description}
+version: "1.0"
+author: Hermes Agent (created via natural language)
+tags: {json.dumps(tags)}
+created: {datetime.utcnow().isoformat()}Z
+---
+
+# {skill_name.replace('_', ' ').title()}
+
+{description}
+
+## Steps
+
+{steps}
+{linked_block}
+## Available Tools
+
+This skill has access to all hermes_trading MCP tools:
+- get_market_bars, get_market_bars_mtf — price data (single or multi-timeframe)
+- get_smc_analysis, visualise_analysis — SMC structure detection and charting
+- get_account_state, get_open_positions, get_trading_stats, get_trade_history
+- send_paper_trade, close_position, draw_trade_signal
+- run_full_backtest, list_strategies, create_strategy — strategy testing
+- get_system_status — health check before acting
+
+## Notes
+
+Created from a natural-language description. Edit this file directly in
+~/.hermes/skills/{safe_name}.md to refine behavior, or ask the agent to
+recreate it with create_hermes_skill using an updated description.
+"""
+
+        try:
+            HERMES_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            skill_path = HERMES_SKILLS_DIR / f"{safe_name}.md"
+            skill_path.write_text(content, encoding="utf-8")
+            log.info(f"Skill created: {skill_path}")
+            return {
+                "success": True,
+                "skill_name": safe_name,
+                "path": str(skill_path),
+                "message": f"Skill '{safe_name}' created. Invoke it with: /skill {safe_name}"
+                           + (f" (backtest-validated by strategy '{linked}')" if linked else "")
+            }
+        except Exception as e:
+            log.error(f"Failed to write skill: {e}")
+            return {"error": str(e)}
+
+    elif name == "list_hermes_skills":
+        try:
+            if not HERMES_SKILLS_DIR.exists():
+                return {"skills": [], "skills_dir": str(HERMES_SKILLS_DIR)}
+            skills = []
+            for f in sorted(HERMES_SKILLS_DIR.glob("*.md")):
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                # Pull frontmatter description if present
+                desc = ""
+                if text.startswith("---"):
+                    fm_end = text.find("---", 3)
+                    if fm_end > 0:
+                        fm = text[3:fm_end]
+                        for line in fm.splitlines():
+                            if line.strip().startswith("description:"):
+                                desc = line.split(":", 1)[1].strip()
+                skills.append({"name": f.stem, "file": f.name, "description": desc})
+            return {"skills": skills, "count": len(skills), "skills_dir": str(HERMES_SKILLS_DIR)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif name == "delete_hermes_skill":
+        skill_name = args.get("skill_name", "").strip()
+        if not skill_name:
+            return {"error": "'skill_name' is required"}
+        safe_name = "".join(c if c.isalnum() or c == "_" else "_" for c in skill_name)
+        path = HERMES_SKILLS_DIR / f"{safe_name}.md"
+        if not path.exists():
+            return {"success": False, "message": f"Skill not found: {path}"}
+        path.unlink()
+        log.info(f"Skill deleted: {path}")
+        return {"success": True, "message": f"Skill '{safe_name}' deleted."}
+
+    elif name == "get_hermes_config":
+        return {
+            "vault_path":          OBSIDIAN_VAULT_ROOT,
+            "skills_dir":          str(HERMES_SKILLS_DIR),
+            "hermes_home_dir":     str(HERMES_HOME_DIR),
+            "log_dir":             str(LOG_DIR),
+            "log_level":           LOG_LEVEL,
+            "default_instrument":  DEFAULT_INSTRUMENT,
+            "mtf_timeframes":      DEFAULT_MTF_LIST,
+            "max_risk_pct":        DEFAULT_MAX_RISK_PCT,
+            "max_daily_drawdown":  DEFAULT_MAX_DAILY_DD,
+            "service_urls": {
+                "mt5_bridge": MT5_URL, "paper_trader": PAPER_URL,
+                "preprocessor": PREPROC_URL, "backtester": BACKTEST_URL,
+                "mcp_bridge": MCP_URL
+            },
+            "note": "All values are set via environment variables. Edit .env or "
+                    "scripts/start_mcp_server.ps1 and restart the MCP server to change them."
+        }
 
     else:
         return {"error": f"Unknown tool: {name}"}

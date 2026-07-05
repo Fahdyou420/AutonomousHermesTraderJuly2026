@@ -55,7 +55,7 @@
         }
     </style>
 </head>
-<body class="h-full flex flex-col font-sans text-gray-100 bg-gray-950 select-none overflow-hidden">
+<body class="h-full flex flex-col font-sans text-gray-100 bg-gray-950 overflow-hidden">
 
     <!-- Top Navigation Header -->
     <header class="flex-none border-b border-gray-900 bg-gray-950 px-6 py-3 flex items-center justify-between">
@@ -91,13 +91,27 @@
                 <i data-lucide="flask-conical" class="w-4 h-4"></i>
                 <span>R&D Lab</span>
             </a>
+            <a href="/logs" class="px-3 py-2 rounded-md flex items-center space-x-1.5 transition {% if active_page == 'logs' %}text-amber-500 bg-amber-500/5 border border-amber-500/10{% else %}text-gray-400 hover:text-gray-200 hover:bg-gray-900{% endif %}" id="nav-logs">
+                <i data-lucide="layers" class="w-4 h-4"></i>
+                <span>Logs</span>
+            </a>
         </nav>
         
-        <!-- Live Clock -->
-        <div class="font-mono text-xs text-gray-500 flex items-center space-x-2 bg-gray-900/40 px-3 py-1.5 rounded border border-gray-900">
-            <span id="gold-spot-val" class="text-amber-500/60 font-medium">XAUUSD: Loading...</span>
-            <span class="text-gray-700">|</span>
-            <span id="utc-clock">UTC: --:--:--</span>
+        <div class="flex items-center space-x-4">
+            <!-- LLM Status Badge -->
+            <div id="llm-status-badge" class="flex items-center space-x-2 px-3 py-1.5 bg-gray-900/60 border border-gray-800 rounded-full font-mono text-xs">
+                <span class="text-gray-500">LLM:</span>
+                <div id="llm-dot" class="w-2 h-2 rounded-full bg-gray-500"></div>
+                <span id="llm-tier" class="text-gray-300 font-bold uppercase">OFFLINE</span>
+                <span id="llm-model" class="text-gray-500">(none)</span>
+            </div>
+
+            <!-- Live Clock -->
+            <div class="font-mono text-xs text-gray-500 flex items-center space-x-2 bg-gray-900/40 px-3 py-1.5 rounded border border-gray-900">
+                <span id="gold-spot-val" class="text-amber-500/60 font-medium">XAUUSD: Loading...</span>
+                <span class="text-gray-700">|</span>
+                <span id="utc-clock">UTC: --:--:--</span>
+            </div>
         </div>
     </header>
 
@@ -168,6 +182,26 @@
         }
         setInterval(updateGoldPrice, 5000);
         updateGoldPrice();
+
+        async function updateLlmStatus() {
+            try {
+                const resp = await fetch('/api/llm/status');
+                const data = await resp.json();
+                const tier = data.tier || 'none';
+                const model = data.model || 'none';
+                
+                document.getElementById('llm-tier').textContent = tier !== 'none' ? tier : 'OFFLINE';
+                document.getElementById('llm-model').textContent = `(${model})`;
+                
+                const dot = document.getElementById('llm-dot');
+                if (tier === 'nous') dot.className = 'w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]';
+                else if (tier === 'gemini') dot.className = 'w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]';
+                else if (tier === 'ollama') dot.className = 'w-2 h-2 rounded-full bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]';
+                else dot.className = 'w-2 h-2 rounded-full bg-gray-500';
+            } catch(e) {}
+        }
+        setInterval(updateLlmStatus, 5000);
+        updateLlmStatus();
     </script>
 </body>
 </html>

@@ -130,7 +130,9 @@ async def get_latest_bars(
                 b_inst = bar_dict.get("instrument", "")
                 b_tf = bar_dict.get("timeframe", bar_dict.get("tf", ""))
                 
-                if b_inst.upper() == instrument.upper() and b_tf.upper() == tf.upper():
+                b_tf_clean = b_tf.replace("PERIOD_", "").upper()
+                tf_clean = tf.replace("PERIOD_", "").upper()
+                if b_inst.upper() == instrument.upper() and b_tf_clean == tf_clean:
                     bars.append(bar_dict)
             except Exception as e:
                 # Silently skip malformed lines
@@ -170,6 +172,10 @@ account_state_store = {
 }
 positions_store = []
 calendar_events_store = []
+# Accumulated closed-deal history pushed by the MT5 EA via ZMQ 'history' messages.
+# The EA sends these in chunks on attach and after each close event.
+live_history_store: List[Dict[str, Any]] = []
+
 
 @app.get("/account_state")
 async def get_account_state():
@@ -200,6 +206,31 @@ async def update_calendar(data: List[Dict[str, Any]]):
     global calendar_events_store
     calendar_events_store = data
     return {"status": "ok", "calendar": calendar_events_store}
+
+
+@app.get("/live_history")
+async def get_live_history(
+    n: int = Query(default=100, ge=1, le=500),
+    instrument: Optional[str] = None
+):
+    """
+    Returns the most recent n closed broker deals received via ZMQ from the MT5 EA.
+    Optionally filter by instrument symbol (e.g. ?instrument=XAUUSD).
+    This is the real broker account history — not paper trades.
+    """
+    result = live_history_store
+    if instrument:
+        result = [d for d in result if d.get("symbol", "").upper() == instrument.upper()]
+    return result[:n]
+
+
+@app.delete("/live_history")
+async def clear_live_history():
+    """Clears the in-memory live history store (does not affect the EA or broker)."""
+    global live_history_store
+    live_history_store.clear()
+    return {"status": "ok", "message": "Live history store cleared"}
+
 
 
 # Background Task: ZeroMQ PULL Receiver
@@ -283,13 +314,23 @@ async def zmq_listener_task():
                     await redis_client.publish("hermes:trade:paper_update", json.dumps(positions_store))
 
             elif msg_type == "history":
-                # Closed trade history chunk
+                # Closed trade history chunk — accumulate into in-memory store
                 deals = payload.get("deals", [])
                 chunk_id = payload.get("chunk_id", 0)
                 logger.info(f"Trade history chunk {chunk_id}: {len(deals)} deals received")
-                if redis_client and deals:
-                    await redis_client.publish("hermes:trade:history_chunk",
-                                               json.dumps({"chunk_id": chunk_id, "deals": deals}))
+                if deals:
+                    global live_history_store
+                    # Avoid duplicates by ticket id
+                    existing_tickets = {d.get("ticket") for d in live_history_store}
+                    new_deals = [d for d in deals if d.get("ticket") not in existing_tickets]
+                    live_history_store.extend(new_deals)
+                    # Keep sorted by close_time descending, cap at 500 records
+                    live_history_store.sort(key=lambda d: d.get("close_time", 0), reverse=True)
+                    live_history_store[:] = live_history_store[:500]
+                    if redis_client:
+                        await redis_client.publish("hermes:trade:history_chunk",
+                                                   json.dumps({"chunk_id": chunk_id, "deals": deals}))
+
 
             elif msg_type == "historical_bars":
                 # Historical OHLCV chunk pushed on EA attach

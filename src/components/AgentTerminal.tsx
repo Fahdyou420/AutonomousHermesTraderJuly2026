@@ -163,8 +163,8 @@ export default function AgentTerminal({ logs, onAddLog }: AgentTerminalProps) {
           break;
       }
     } else {
-      // Natural language query to Hermes (Gemini API server-proxy)
-      addLine('tool-call', 'Directing prompt request to Hermes LLM Core (Gemini 3.5-Flash + Ollama-RAG)...');
+      // Natural language query to Hermes (Nous Portal / Gemini / Ollama)
+      addLine('tool-call', 'Directing prompt request to Hermes LLM Core (Nous/Gemini/Ollama)...');
       setIsTyping(true);
       
       try {
@@ -176,7 +176,8 @@ export default function AgentTerminal({ logs, onAddLog }: AgentTerminalProps) {
         const data = await res.json();
         setIsTyping(false);
         if (data.text) {
-          addLine('output', data.text);
+          const providerStr = data.provider ? ` [via ${data.provider}]` : '';
+          addLine('output', `${data.text}\n\n${providerStr}`);
         } else if (data.error) {
           addLine('error', `Failed to prompt LLM: ${data.error}`);
         }
@@ -209,7 +210,7 @@ export default function AgentTerminal({ logs, onAddLog }: AgentTerminalProps) {
             <span className="w-1.5 h-1.5 rounded-full bg-cyan-450 animate-ping"></span>
             <span className="text-cyan-400 font-bold lowercase tracking-normal">host integrated</span>
           </span>
-          <span className="bg-slate-900/40 border border-white/5 px-2 py-0.5 rounded text-slate-400">Ollama/Gemini-Fullstack</span>
+          <span className="bg-slate-900/40 border border-white/5 px-2 py-0.5 rounded text-slate-400">Nous/Gemini/Ollama</span>
         </div>
       </div>
 
@@ -285,7 +286,7 @@ export default function AgentTerminal({ logs, onAddLog }: AgentTerminalProps) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               className="bg-transparent text-slate-100 flex-1 outline-none font-mono text-xs border-0 py-1"
-              placeholder="Query Gemini/Ollama, or type slash command (e.g., /backtest, /risk)..."
+              placeholder="Query Nous/Gemini/Ollama, or type slash command (e.g., /backtest, /risk)..."
             />
             <button
               id="btn-terminal-submit"

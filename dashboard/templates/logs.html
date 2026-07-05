@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="h-full p-6 flex flex-col space-y-4">
+    <div class="flex items-center justify-between">
+        <h2 class="text-xl font-bold font-mono tracking-widest text-amber-500 flex items-center space-x-2">
+            <i data-lucide="layers" class="w-6 h-6"></i>
+            <span>SYSTEM & LLM LOGS</span>
+        </h2>
+    </div>
+
+    <div class="flex-1 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden flex flex-col">
+        <div class="bg-gray-800/50 p-3 border-b border-gray-800 flex items-center space-x-2">
+            <i data-lucide="activity" class="w-4 h-4 text-cyan-400 animate-pulse"></i>
+            <span class="text-xs font-mono font-bold tracking-widest text-gray-300 uppercase">
+                Live Log Stream (Redis Pub/Sub)
+            </span>
+        </div>
+        <div id="logs-container" class="flex-1 overflow-y-auto p-4 space-y-2 font-mono text-xs bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-gray-900 to-black">
+            <div id="logs-placeholder" class="text-gray-500 italic text-center mt-10">Waiting for events...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const logsContainer = document.getElementById('logs-container');
+    const placeholder = document.getElementById('logs-placeholder');
+    let logCount = 0;
+
+    function getLogLevelColor(level) {
+        switch (level) {
+            case 'SUCCESS': return 'text-emerald-400';
+            case 'WARNING': return 'text-amber-500';
+            case 'ERROR': return 'text-rose-500';
+            default: return 'text-cyan-400';
+        }
+    }
+
+    const evtSource = new EventSource("/api/logs/stream");
+    
+    evtSource.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.event === "connected") return;
+
+            if (placeholder) {
+                placeholder.style.display = 'none';
+            }
+
+            const logDiv = document.createElement('div');
+            logDiv.className = "border-b border-gray-800/50 pb-2 mb-2 last:border-0 hover:bg-white/[0.02] p-1 transition-colors rounded";
+            
+            const timeStr = new Date(data.timestamp).toLocaleTimeString();
+            const levelColor = getLogLevelColor(data.level);
+            
+            logDiv.innerHTML = `
+                <div class="flex items-center space-x-3 mb-1">
+                    <span class="text-gray-500">${timeStr}</span>
+                    <span class="font-bold uppercase ${levelColor}">[${data.level}]</span>
+                    <span class="text-amber-500/70">${data.source}</span>
+                </div>
+                <div class="text-gray-300 pl-4 whitespace-pre-wrap leading-relaxed">${data.text}</div>
+            `;
+            
+            logsContainer.appendChild(logDiv);
+            logCount++;
+            
+            // Auto scroll
+            logsContainer.scrollTop = logsContainer.scrollHeight;
+            
+            // Limit to 200 items
+            if (logCount > 200 && logsContainer.firstChild) {
+                logsContainer.removeChild(logsContainer.firstChild);
+                logCount--;
+            }
+        } catch (e) {
+            console.error("Error parsing SSE log", e);
+        }
+    };
+});
+</script>
+{% endblock %}

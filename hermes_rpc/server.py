@@ -8,6 +8,15 @@ import httpx
 from datetime import datetime, date
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
+from dotenv import load_dotenv
+load_dotenv(override=True)  # override=True ensures .env wins over any stale system/user env vars (e.g. OLLAMA_HOST=0.0.0.0)
+
+# ── LLM Fallback Chain: Nous Portal → Gemini → Ollama ─────────────────────────
+NOUS_API_KEY   = os.getenv("NOUS_API_KEY", "")
+NOUS_MODEL     = os.getenv("NOUS_MODEL", "stepfun/step-3.7-flash:free")
+NOUS_BASE_URL  = "https://inference-api.nousresearch.com/v1"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash"
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +44,7 @@ app.add_middleware(
 
 # Configuration defaults for Windows Host execution environment
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-VAULT_ROOT  = os.getenv("OBSIDIAN_VAULT_ROOT", "C:\\Fahd data AI\\Fahd\\Vault")
+VAULT_ROOT  = os.getenv("OBSIDIAN_VAULT_ROOT", os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local")), "hermes", "obsidian"))
 
 # Discover the actual model names installed in Ollama at startup
 # rather than hardcoding names that may not match
@@ -60,11 +69,11 @@ def _discover_ollama_model(preference_keywords: list, fallback: str) -> str:
 
 # Resolved at import time — picks the right model name whatever Ollama has installed
 _ANALYSIS_MODEL = os.getenv("MODEL_ANALYSIS") or _discover_ollama_model(
-    ["hermes", "llama3", "mistral", "qwen"], "llama3.2")
+    ["hermes", "llama3", "mistral", "qwen"], "hermes3:latest")
 _CODE_MODEL     = os.getenv("MODEL_CODE")     or _discover_ollama_model(
     ["qwen2.5-coder", "qwen", "codellama", "deepseek-coder"], _ANALYSIS_MODEL)
 _BULK_MODEL     = os.getenv("MODEL_BULK")     or _discover_ollama_model(
-    ["llama3.2:3b", "llama3.2", "phi3", "gemma"], _ANALYSIS_MODEL)
+    ["qwen-coder:latest", "llama-3-8b:latest", "phi3", "gemma"], _ANALYSIS_MODEL)
 
 logging.getLogger(__name__).info(
     f"Ollama models resolved — analysis:{_ANALYSIS_MODEL} code:{_CODE_MODEL} bulk:{_BULK_MODEL}")
@@ -460,6 +469,7 @@ async def process_potential_tool_call_in_text(text: str):
     pattern = r"\[TOOL:\s*(\w+)\]\s*(\{[\s\S]*?\})\s*\[/TOOL\]"
     matches = re.finditer(pattern, text)
     
+    results = []
     for match in matches:
         t_name = match.group(1).strip()
         p_str = match.group(2).strip()
@@ -468,9 +478,12 @@ async def process_potential_tool_call_in_text(text: str):
         try:
             params = json.loads(p_str)
             result = await execute_tool_by_name(t_name, params)
-            logger.info(f"Auto-tool execution complete. Outcome payload status: {result.get('success')}")
+            logger.info(f"Auto-tool execution complete. Outcome: {result}")
+            results.append(f"\n\n[System: Tool {t_name} returned -> {json.dumps(result)}]")
         except Exception as e:
             logger.error(f"Failed parsing/invoking inline tool {t_name}: {e}")
+            results.append(f"\n\n[System: Tool {t_name} failed -> {e}]")
+    return "".join(results)
 
 # ==========================================
 # FASTAPI ENDPOINT INGESTION API
@@ -484,10 +497,11 @@ async def health():
     details = "unreachable"
     loop = asyncio.get_event_loop()
     try:
-        resp = await loop.run_in_executor(None, lambda: requests.get(f"{OLLAMA_HOST}/", timeout=2))
-        if resp.status_code == 200 or "Ollama" in resp.text:
+        resp = await loop.run_in_executor(None, lambda: requests.get(f"{OLLAMA_HOST}/api/tags", timeout=2))
+        if resp.status_code == 200:
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
             ollama_ok = True
-            details = "active"
+            details = f"active ({len(models)} models loaded)"
     except Exception as e:
         details = f"failed to connect ({e})"
         
@@ -525,48 +539,91 @@ async def execute_tool_endpoint(payload: ToolExecutionPayload):
 @app.post("/chat")
 async def stream_chat_endpoint(payload: ChatPayload):
     """
-    Channels prompt sequences directly into local Ollama process.
+    LLM Fallback Chain: Nous Portal (stepfun/step-3.7-flash:free) → Gemini → Ollama.
     Streams structured token contents back as clean Server-Sent-Events.
     Processes any included automated tool executions.
     """
     task = payload.task_type or "analysis"
-    selected_model = MODEL_MAP.get(task, "Hermes-3")
-    logger.info(f"Resolving chat. Task class: '{task}' -> Model: '{selected_model}'")
+    logger.info(f"Resolving chat. Task class: '{task}'. LLM chain: Nous→Gemini→Ollama")
     
     sys_prompt = load_system_prompt()
-    
-    # Construct Ollama context format
-    messages = [
-        {"role": "system", "content": sys_prompt}
-    ]
-    
-    # Inject chat timelines history if parsed inside context metadata
+    messages = [{"role": "system", "content": sys_prompt}]
     if payload.context and "history" in payload.context:
-        for idx, item in enumerate(payload.context["history"]):
-            messages.append({
-                "role": item.get("role", "user"),
-                "content": item.get("content", "")
-            })
-            
+        for item in payload.context["history"]:
+            messages.append({"role": item.get("role", "user"), "content": item.get("content", "")})
     messages.append({"role": "user", "content": payload.message})
 
+    # ── Tier 1: Nous Portal ────────────────────────────────────────────────────
+    async def _try_nous() -> Optional[str]:
+        if not NOUS_API_KEY:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{NOUS_BASE_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {NOUS_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": NOUS_MODEL, "messages": messages, "stream": False},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    logger.info(f"[LLM] Nous Portal ({NOUS_MODEL}) responded successfully")
+                    return text
+                logger.warning(f"[LLM] Nous Portal failed ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"[LLM] Nous Portal exception: {e}")
+        return None
+
+    # ── Tier 2: Gemini ─────────────────────────────────────────────────────────
+    async def _try_gemini() -> Optional[str]:
+        if not GEMINI_API_KEY:
+            return None
+        try:
+            gemini_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            )
+            gemini_messages = [{"role": m["role"] if m["role"] != "system" else "user",
+                                "parts": [{"text": m["content"]}]} for m in messages]
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(gemini_url, json={"contents": gemini_messages})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    logger.info(f"[LLM] Gemini ({GEMINI_MODEL}) responded successfully")
+                    return text
+                logger.warning(f"[LLM] Gemini failed ({resp.status_code})")
+        except Exception as e:
+            logger.warning(f"[LLM] Gemini exception: {e}")
+        return None
+
     async def sse_event_generator():
-        target_endpoint = f"{OLLAMA_HOST}/api/chat"
-        req_params = {
-            "model": selected_model,
-            "messages": messages,
-            "stream": True
-        }
-        
         full_tokens_buff = []
-        
+
+        # Try Nous first, then Gemini
+        for tier_name, tier_fn in [("Nous", _try_nous), ("Gemini", _try_gemini)]:
+            text = await tier_fn()
+            if text:
+                full_tokens_buff.append(text)
+                yield f"data: {text}\n\n"
+                tool_out = await process_potential_tool_call_in_text(text)
+                if tool_out:
+                    yield f"data: {tool_out}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            logger.info(f"[LLM] {tier_name} unavailable, trying next tier...")
+
+        # ── Tier 3: Ollama (local fallback) ───────────────────────────────────
+        selected_model = MODEL_MAP.get(task, _ANALYSIS_MODEL)
+        logger.info(f"[LLM] Falling through to Ollama: {selected_model}")
+        target_endpoint = f"{OLLAMA_HOST}/api/chat"
+        req_params = {"model": selected_model, "messages": messages, "stream": True}
         async with httpx.AsyncClient(timeout=300.0) as client:
             try:
                 async with client.stream("POST", target_endpoint, json=req_params) as r:
                     if r.status_code != 200:
-                        yield f"data: Ollama returned status error code: {r.status_code}\n\n"
+                        yield f"data: [LLM] All providers failed. Ollama returned {r.status_code}\n\n"
                         return
-                        
                     async for line in r.aiter_lines():
                         if not line:
                             continue
@@ -575,19 +632,16 @@ async def stream_chat_endpoint(payload: ChatPayload):
                             tok_val = line_data.get("message", {}).get("content", "")
                             if tok_val:
                                 full_tokens_buff.append(tok_val)
-                                # Stream tokens to caller
                                 yield f"data: {tok_val}\n\n"
                         except json.JSONDecodeError:
-                            pass # bypass structural line feeds
-                            
-                # Fully received. Parse outputs sequentially for trigger annotations
+                            pass
                 accumulated_text = "".join(full_tokens_buff)
-                await process_potential_tool_call_in_text(accumulated_text)
-                
-                # Suffix complete signal
+                tool_out = await process_potential_tool_call_in_text(accumulated_text)
+                if tool_out:
+                    yield f"data: {tool_out}\n\n"
                 yield "data: [DONE]\n\n"
             except httpx.RequestError as exc:
-                logger.error(f"Ollama network communication exception: {exc}")
+                logger.error(f"Ollama network error: {exc}")
                 yield f"data: [Host Ollama Error] {str(exc)}\n\n"
             except Exception as exc:
                 logger.error(f"Unmanaged exception in token stream: {exc}")

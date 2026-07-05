@@ -3,6 +3,8 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
+import { createClient } from "redis";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -11,7 +13,28 @@ const app = express();
 const PORT = 3000;
 app.use(express.json());
 
-// ─── Gemini (optional) ────────────────────────────────────────────────────────
+// ─── LLM Providers (3-tier fallback: Nous Portal → Gemini → Ollama) ──────────
+const SMC_SYSTEM_INSTRUCTION =
+  "You are the Hermes Trading Agent — a precise SMC/ICT specialist for XAUUSD. Demand rigorous risk management in every analysis.";
+
+// Tier 1: Nous Portal (stepfun/step-3.7-flash:free — free tier)
+let nousClient: OpenAI | null = null;
+const nousModel = process.env.NOUS_MODEL || "stepfun/step-3.7-flash:free";
+try {
+  if (process.env.NOUS_API_KEY) {
+    nousClient = new OpenAI({
+      apiKey: process.env.NOUS_API_KEY,
+      baseURL: "https://inference-api.nousresearch.com/v1",
+    });
+    console.log(`[LLM] Nous Portal client initialized (${nousModel})`);
+  } else {
+    console.log("[LLM] NOUS_API_KEY not set — Nous Portal tier disabled");
+  }
+} catch (err) {
+  console.error("[LLM] Nous Portal init failed:", err);
+}
+
+// Tier 2: Gemini (optional)
 let ai: GoogleGenAI | null = null;
 try {
   if (process.env.GEMINI_API_KEY) {
@@ -19,9 +42,68 @@ try {
       apiKey: process.env.GEMINI_API_KEY,
       httpOptions: { headers: { "User-Agent": "aistudio-build" } }
     });
+    console.log("[LLM] Gemini client initialized (gemini-2.5-flash)");
+  } else {
+    console.log("[LLM] GEMINI_API_KEY not set — Gemini tier disabled");
   }
 } catch (err) {
-  console.error("GoogleGenAI init failed:", err);
+  console.error("[LLM] Gemini init failed:", err);
+}
+
+// Tier 3: Ollama (always available if running)
+let rawOllama = process.env.OLLAMA_URL || process.env.OLLAMA_HOST || "http://127.0.0.1:11434";
+if (!rawOllama.startsWith("http")) {
+  rawOllama = `http://${rawOllama === "0.0.0.0" ? "127.0.0.1" : rawOllama}:11434`;
+}
+const ollamaBaseUrl = rawOllama;
+const ollamaModel = process.env.MODEL_ANALYSIS || "hermes3:latest";
+let ollamaClient: OpenAI | null = null;
+try {
+  ollamaClient = new OpenAI({
+    apiKey: "ollama",
+    baseURL: `${ollamaBaseUrl}/v1`,
+  });
+  console.log(`[LLM] Ollama client initialized (${ollamaModel} @ ${ollamaBaseUrl})`);
+} catch (err) {
+  console.error("[LLM] Ollama client init failed:", err);
+}
+
+// ─── Redis Clients (State & Pub/Sub) ──────────────────────────────────────────
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+const redisClient = createClient({ url: redisUrl });
+const redisSub = createClient({ url: redisUrl });
+
+redisClient.on('error', err => console.error('[Redis] Client Error', err));
+redisSub.on('error', err => console.error('[Redis] Sub Error', err));
+
+async function initRedis() {
+  try {
+    await redisClient.connect();
+    await redisSub.connect();
+    // Initialize LLM status if not present
+    const existing = await redisClient.get("LLM_ACTIVE_STATUS");
+    if (!existing) {
+      await redisClient.set("LLM_ACTIVE_STATUS", JSON.stringify({ tier: "none", model: "none" }));
+    }
+  } catch (err) {
+    console.error("[Redis] Connection failed", err);
+  }
+}
+initRedis();
+
+// Helper to broadcast logs to all dashboards
+async function broadcastLog(source: string, level: string, text: string) {
+  const entry = { id: `log_${Date.now()}`, timestamp: new Date().toISOString(), source, level, text };
+  logs.push(entry);
+  if (logs.length > 200) logs.shift();
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.publish("SYSTEM_LOGS", JSON.stringify(entry));
+    }
+  } catch (err) {
+    console.error("[Redis] Failed to publish log:", err);
+  }
+  return entry;
 }
 
 // ─── Runtime state (in-memory cache — real data lives in SQLite/Obsidian/ChromaDB) ──
@@ -225,22 +307,22 @@ app.get("/api/market", async (_req, res) => {
   let obList = orderBlocks;
   let liqList = liquidityPools;
 
-  // Try SMC analysis from preprocessor
+  // Run preprocessor and MT5 bars in PARALLEL to halve endpoint latency
+  const [smcResult, barsResult] = await Promise.allSettled([
+    fetchWithTimeout("http://preprocessor:5559/smc_analysis?instrument=XAUUSD&tf=M15&n=300", {}, 5000),
+    fetchWithTimeout("http://mt5_bridge:5558/latest_bars?instrument=XAUUSD&tf=M15&n=50", {}, 6000)
+  ]);
   try {
-    const r = await fetchWithTimeout("http://preprocessor:5559/smc_analysis?instrument=XAUUSD&tf=M15&n=300", {}, 2000);
-    if (r.ok) {
-      const d = await r.json();
+    if (smcResult.status === "fulfilled" && smcResult.value.ok) {
+      const d = await smcResult.value.json();
       if (d.fvg?.length) fvgList = d.fvg;
       if (d.order_blocks?.length) obList = d.order_blocks;
       if (d.liquidity?.length) liqList = d.liquidity;
     }
   } catch (_) {}
-
-  // Try live bars from MT5 bridge
   try {
-    const r = await fetchWithTimeout("http://mt5_bridge:5558/latest_bars?instrument=XAUUSD&tf=M15&n=50", {}, 2000);
-    if (r.ok) {
-      const bars = await r.json();
+    if (barsResult.status === "fulfilled" && barsResult.value.ok) {
+      const bars = await barsResult.value.json();
       if (Array.isArray(bars) && bars.length > 0) {
         price = bars[bars.length - 1].close;
         high = Math.max(...bars.map((b: any) => b.high));
@@ -453,12 +535,41 @@ app.post("/api/trades/close/:id", async (req, res) => {
 
 app.get("/api/logs", (_req, res) => res.json(logs));
 
-app.post("/api/logs", (req, res) => {
+app.post("/api/logs", async (req, res) => {
   const { source, level, text } = req.body;
-  const entry = { id: `log_${Date.now()}`, timestamp: new Date().toISOString(), source: source || "SYSTEM", level: level || "INFO", text };
-  logs.push(entry);
-  if (logs.length > 200) logs.shift();
+  const entry = await broadcastLog(source || "SYSTEM", level || "INFO", text);
   res.json(entry);
+});
+
+app.get("/api/logs/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const listener = (message: string, channel: string) => {
+    if (channel === "SYSTEM_LOGS") {
+      res.write(`data: ${message}\n\n`);
+    }
+  };
+
+  redisSub.subscribe("SYSTEM_LOGS", listener);
+  
+  // Send connection ack
+  res.write(`data: ${JSON.stringify({ event: 'connected', message: 'SSE Log stream established' })}\n\n`);
+
+  req.on("close", () => {
+    redisSub.unsubscribe("SYSTEM_LOGS", listener);
+  });
+});
+
+app.get("/api/llm/status", async (_req, res) => {
+  try {
+    const data = await redisClient.get("LLM_ACTIVE_STATUS");
+    res.json(data ? JSON.parse(data) : { tier: "none", model: "none" });
+  } catch (err) {
+    res.json({ tier: "none", model: "none" });
+  }
 });
 
 app.get("/api/vault", (_req, res) => {
@@ -614,18 +725,10 @@ app.get("/api/errors", async (_req, res) => {
   res.json([]);
 });
 
-// Gemini / SMC analysis endpoint
-app.post("/api/gemini/analyze", async (req, res) => {
-  const { prompt, type } = req.body;
-
-  if (!ai) {
-    return res.status(503).json({ error: "Gemini not configured. Set GEMINI_API_KEY." });
-  }
-
-  try {
-    let finalPrompt = prompt;
-    if (type === "smc-audit") {
-      finalPrompt = `You are the Hermes Trading Agent analyzing XAUUSD.
+// ─── LLM Analysis endpoint (3-tier fallback: Nous Portal → Gemini → Ollama) ──
+function buildAnalysisPrompt(prompt: string, type: string): string {
+  if (type === "smc-audit") {
+    return `You are the Hermes Trading Agent analyzing XAUUSD.
 Current price: $${currentPrice}
 FVGs: ${JSON.stringify(fairValueGaps)}
 Order Blocks: ${JSON.stringify(orderBlocks)}
@@ -634,29 +737,218 @@ Liquidity: ${JSON.stringify(liquidityPools)}
 Analyse using SMC/ICT: identify setups, structural context, and entry conditions.
 Risk constraints: max 1% per trade, staged trust model (hypothesis→backtest→paper→live).
 Respond in professional Markdown.`;
-    }
+  }
+  return prompt;
+}
 
+async function setLlmStatus(tier: string, model: string) {
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.set("LLM_ACTIVE_STATUS", JSON.stringify({ tier, model }));
+    }
+  } catch (err) {
+    console.error("[Redis] Failed to set LLM status", err);
+  }
+}
+
+
+const DASHBOARD_TOOLS: any[] = [
+  {
+    type: "function",
+    function: {
+      name: "get_current_price",
+      description: "Get the current market price for an instrument.",
+      parameters: {
+        type: "object",
+        properties: {
+          instrument: { type: "string", description: "The symbol, e.g. XAUUSD" }
+        },
+        required: ["instrument"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_account_state",
+      description: "Get current MT5 account balance and equity.",
+      parameters: { type: "object", properties: {} }
+    }
+  }
+];
+
+async function executeDashboardTool(name: string, args: any): Promise<string> {
+  try {
+    if (name === "get_current_price") {
+      const inst = args.instrument || "XAUUSD";
+      const r = await fetchWithTimeout(`http://mt5_bridge:5558/latest_bars?instrument=${inst}&tf=M15&n=1`, {}, 5000);
+      if (r.ok) {
+        const bars = await r.json();
+        if (Array.isArray(bars) && bars.length > 0) return JSON.stringify({ price: bars[bars.length - 1].close });
+      }
+      return JSON.stringify({ error: "Could not fetch price" });
+    }
+    if (name === "get_account_state") {
+      const r = await fetchWithTimeout("http://mt5_bridge:5558/account_state", {}, 5000);
+      if (r.ok) {
+        const data = await r.json();
+        return JSON.stringify(data);
+      }
+      return JSON.stringify({ error: "Could not fetch account state" });
+    }
+    return JSON.stringify({ error: `Tool ${name} not implemented` });
+  } catch (e: any) {
+    return JSON.stringify({ error: e.message });
+  }
+}
+
+
+async function tryNousPortal(finalPrompt: string): Promise<{ text: string; provider: string } | null> {
+  if (!nousClient) return null;
+  const start = Date.now();
+  let messages: any[] = [
+    { role: "system", content: SMC_SYSTEM_INSTRUCTION },
+    { role: "user", content: finalPrompt }
+  ];
+  try {
+    let completion = await nousClient.chat.completions.create({
+      model: nousModel,
+      messages: messages,
+      max_tokens: 4096,
+      temperature: 0.7,
+      tools: DASHBOARD_TOOLS
+    });
+    
+    let message = completion.choices?.[0]?.message;
+    if (message?.tool_calls && message.tool_calls.length > 0) {
+      messages.push(message);
+      for (const tc of message.tool_calls as any[]) {
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments); } catch (e) {}
+        const result = await executeDashboardTool(tc.function.name, args);
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          name: tc.function.name,
+          content: result
+        });
+      }
+      completion = await nousClient.chat.completions.create({
+        model: nousModel,
+        messages: messages,
+        max_tokens: 4096,
+        temperature: 0.7,
+        tools: DASHBOARD_TOOLS
+      });
+      message = completion.choices?.[0]?.message;
+    }
+    
+    const text = message?.content;
+    const latency = Date.now() - start;
+    if (text) {
+      console.log(`[LLM] Nous Portal (${nousModel}) responded successfully`);
+      await setLlmStatus("nous", nousModel);
+      await broadcastLog("LLM_CASCADE", "SUCCESS", `Tier 1: Nous Portal (${nousModel}) completed in ${latency}ms`);
+      return { text, provider: "nous-portal" };
+    }
+    return null;
+  } catch (e: any) {
+    const latency = Date.now() - start;
+    console.warn(`[LLM] Nous Portal failed, falling through: ${e.message}`);
+    await broadcastLog("LLM_CASCADE", "WARNING", `Tier 1: Nous Portal failed in ${latency}ms - ${e.message}`);
+    return null;
+  }
+}
+
+async function tryGemini(finalPrompt: string): Promise<{ text: string; provider: string } | null> {
+  if (!ai) return null;
+  const start = Date.now();
+  try {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: finalPrompt,
-      config: {
-        systemInstruction:
-          "You are the Hermes Trading Agent — a precise SMC/ICT specialist for XAUUSD. Demand rigorous risk management in every analysis."
-      }
+      config: { systemInstruction: SMC_SYSTEM_INSTRUCTION }
     });
-
-    res.json({ text: response.text });
+    const text = response.text;
+    const latency = Date.now() - start;
+    if (text) {
+      console.log("[LLM] Gemini (gemini-2.5-flash) responded successfully");
+      await setLlmStatus("gemini", "gemini-2.5-flash");
+      await broadcastLog("LLM_CASCADE", "SUCCESS", `Tier 2: Gemini (gemini-2.5-flash) completed in ${latency}ms`);
+      return { text, provider: "gemini" };
+    }
+    return null;
   } catch (e: any) {
-    console.error("Gemini error:", e);
-    res.status(500).json({ error: e.message });
+    const latency = Date.now() - start;
+    console.warn("[LLM] Gemini failed, falling through:", e.message);
+    await broadcastLog("LLM_CASCADE", "WARNING", `Tier 2: Gemini failed in ${latency}ms - ${e.message}`);
+    return null;
   }
-});
+}
+
+async function tryOllama(finalPrompt: string): Promise<{ text: string; provider: string } | null> {
+  if (!ollamaClient) return null;
+  const start = Date.now();
+  try {
+    const completion = await ollamaClient.chat.completions.create({
+      model: ollamaModel,
+      messages: [
+        { role: "system", content: SMC_SYSTEM_INSTRUCTION },
+        { role: "user", content: finalPrompt }
+      ],
+    });
+    const text = completion.choices?.[0]?.message?.content;
+    const latency = Date.now() - start;
+    if (text) {
+      console.log(`[LLM] Ollama (${ollamaModel}) responded successfully`);
+      await setLlmStatus("ollama", ollamaModel);
+      await broadcastLog("LLM_CASCADE", "SUCCESS", `Tier 3: Ollama (${ollamaModel}) completed in ${latency}ms`);
+      return { text, provider: "ollama" };
+    }
+    return null;
+  } catch (e: any) {
+    const latency = Date.now() - start;
+    console.warn("[LLM] Ollama failed:", e.message);
+    await broadcastLog("LLM_CASCADE", "ERROR", `Tier 3: Ollama failed in ${latency}ms - ${e.message}`);
+    return null;
+  }
+}
+
+const analysisHandler = async (req: express.Request, res: express.Response) => {
+  const { prompt, type } = req.body;
+  const finalPrompt = buildAnalysisPrompt(prompt || "", type || "user-chat");
+
+  // Tier 1: Nous Portal
+  const nousResult = await tryNousPortal(finalPrompt);
+  if (nousResult) return res.json(nousResult);
+
+  // Tier 2: Gemini
+  const geminiResult = await tryGemini(finalPrompt);
+  if (geminiResult) return res.json(geminiResult);
+
+  // Tier 3: Ollama
+  const ollamaResult = await tryOllama(finalPrompt);
+  if (ollamaResult) return res.json(ollamaResult);
+
+  // All tiers failed
+  await setLlmStatus("none", "all_failed");
+  await broadcastLog("LLM_CASCADE", "ERROR", "All LLM providers unavailable.");
+  res.status(503).json({
+    error: "All LLM providers unavailable. Configure NOUS_API_KEY, GEMINI_API_KEY, or ensure Ollama is running.",
+    provider: "none"
+  });
+};
+
+// Primary route
+app.post("/api/analyze", analysisHandler);
+// Backward-compatible alias
+app.post("/api/gemini/analyze", analysisHandler);
 
 // ─── Server bootstrap ─────────────────────────────────────────────────────────
 async function startServer() {
   // Seed price from MT5 before opening to traffic
   try {
-    const r = await fetchWithTimeout("http://mt5_bridge:5558/latest_bars?instrument=XAUUSD&tf=M15&n=1", {}, 3000);
+    const r = await fetchWithTimeout("http://mt5_bridge:5558/latest_bars?instrument=XAUUSD&tf=M15&n=1", {}, 5000);
     if (r.ok) {
       const bars = await r.json();
       if (Array.isArray(bars) && bars.length > 0) {

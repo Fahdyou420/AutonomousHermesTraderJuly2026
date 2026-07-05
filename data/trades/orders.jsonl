@@ -1,0 +1,2 @@
+{"timestamp": 1783096760, "command": {"cmd": "order", "action": "CLOSE", "instrument": "XAUUSD", "lots": 0.0, "sl": 0.0, "tp": 0.0, "comment": "487980591", "magic": 123456}}
+{"timestamp": 1783248945, "command": {"cmd": "order", "action": "CLOSE", "instrument": "XAUUSD", "lots": 0.0, "sl": 0.0, "tp": 0.0, "comment": "487980591", "magic": 123456}}

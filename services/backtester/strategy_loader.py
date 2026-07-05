@@ -29,6 +29,15 @@ log = logging.getLogger("strategy_loader")
 
 CUSTOM_STRATEGY_DIR = Path(os.getenv("STRATEGY_DIR", "/data/strategies"))
 
+COMPAT_ALIASES = {
+    "smc_ob_entry": "ob_reaction",
+    "ob_entry": "ob_reaction",
+    "smc_fvg_fill": "fvg_fill",
+    "fvg": "fvg_fill",
+    "smc_liquidity_sweep": "liquidity_sweep_reversal",
+    "liquidity_sweep": "liquidity_sweep_reversal",
+}
+
 
 def _load_custom_strategies() -> Dict[str, Type[BaseStrategy]]:
     """Scan /data/strategies/*.py and import any BaseStrategy subclasses."""
@@ -76,14 +85,19 @@ def list_strategies() -> List[Dict]:
 
 def load_strategy(name: str) -> Optional[Type[BaseStrategy]]:
     """Return strategy class by name, or None if not found."""
-    # Check builtins first
+    canonical = COMPAT_ALIASES.get(name, name)
+
+    if canonical in BUILTIN_STRATEGIES:
+        return BUILTIN_STRATEGIES[canonical]
     if name in BUILTIN_STRATEGIES:
         return BUILTIN_STRATEGIES[name]
-    # Then custom
+
     custom = _load_custom_strategies()
-    if name in custom:
-        return custom[name]
-    log.warning(f"Strategy '{name}' not found. Available: {list(BUILTIN_STRATEGIES.keys()) + list(custom.keys())}")
+    for key in (canonical, name):
+        if key in custom:
+            return custom[key]
+
+    log.warning(f"Strategy '{name}' not found. Available: {list(BUILTIN_STRATEGIES.keys()) + list(_load_custom_strategies().keys())}")
     return None
 
 
@@ -98,12 +112,10 @@ def validate_strategy_code(code: str) -> tuple[bool, str]:
     except SyntaxError as e:
         return False, f"Syntax error: {e}"
 
-    # Must import BaseStrategy and define exactly one subclass
     class_defs = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
     if not class_defs:
         return False, "No class definition found. Strategy must define a class that inherits from BaseStrategy."
 
-    # Check for required attributes
     for cls in class_defs:
         attrs = {n.targets[0].id: n for n in ast.walk(cls)
                  if isinstance(n, ast.Assign) and n.targets and isinstance(n.targets[0], ast.Name)}
@@ -112,7 +124,6 @@ def validate_strategy_code(code: str) -> tuple[bool, str]:
         if "description" not in attrs:
             return False, f"Class {cls.name} missing required 'description' attribute."
 
-    # Check for find_signal method
     has_find_signal = any(
         isinstance(n, ast.FunctionDef) and n.name == "find_signal"
         for cls in class_defs for n in ast.walk(cls)

@@ -1,0 +1,19 @@
+{
+  "mode": "TEST",
+  "default_instrument": "BTCUSD",
+  "instruments": [
+    "BTCUSD",
+    "XAUUSD"
+  ],
+  "mtf_timeframes": [
+    "M5",
+    "M15",
+    "H1",
+    "H4",
+    "D1"
+  ],
+  "max_risk_pct": 1.0,
+  "max_daily_drawdown": 3.0,
+  "paper_balance": 10000.0,
+  "notes": "Created 2026-07-05 to align local repo config with active BTCUSD testing."
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "rnd_hyp_03b689fa",
+    "hypothesis": "Use the smc_trading_cycle skill, phase: scan",
+    "status": "completed",
+    "timestamp": 1783071260,
+    "completed_at": "2026-07-04 +0000",
+    "result": "05_RND/results/rnd_hyp_03b689fa_backtest.md"
+  }
+]

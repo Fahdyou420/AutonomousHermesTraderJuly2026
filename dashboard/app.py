@@ -5,6 +5,8 @@ import requests
 import redis as redis_lib
 from flask import Flask, Response, redirect, jsonify, render_template, request
 from flask_cors import CORS
+from dotenv import load_dotenv
+load_dotenv(override=True)  # override=True ensures .env wins over stale system/user env vars
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -33,7 +35,7 @@ CHROMADB_URL = os.getenv("CHROMADB_URL", "http://chromadb:8000")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
 
 
-def _get(url: str, timeout: int = 3):
+def _get(url: str, timeout: int = 5):
     try:
         r = requests.get(url, timeout=timeout)
         if r.status_code == 200:
@@ -98,7 +100,7 @@ def system_status():
 @app.route('/api/market/price', methods=['GET'])
 def get_market_price():
     """Live price from MT5 bridge."""
-    data = _get(f"{MT5_BRIDGE_URL}/latest_bars?n=1", timeout=5)
+    data = _get(f"{MT5_BRIDGE_URL}/latest_bars?instrument=XAUUSD&tf=M15&n=1", timeout=5)
     if data and isinstance(data, list) and len(data) > 0:
         return jsonify({"price": data[-1].get("close", 0.0)})
     return jsonify({"price": 0.0})
@@ -136,9 +138,48 @@ def view_trades():
 def view_rnd():
     return render_template('rnd.html', active_page='rnd')
 
+@app.route('/logs')
+def view_logs():
+    return render_template('logs.html', active_page='logs')
+
 @app.route('/')
 def home_redirect():
     return redirect('/terminal')
+
+@app.route('/api/llm/status', methods=['GET'])
+def llm_status():
+    try:
+        r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        data = r.get("LLM_ACTIVE_STATUS")
+        if data:
+            return jsonify(json.loads(data))
+    except Exception:
+        pass
+    return jsonify({"tier": "none", "model": "none"})
+
+@app.route('/api/logs/stream', methods=['GET'])
+def stream_system_logs():
+    def event_generator():
+        pubsub = None
+        try:
+            r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+            pubsub = r.pubsub()
+            pubsub.subscribe("SYSTEM_LOGS")
+            yield f"data: {json.dumps({'event': 'connected', 'message': 'SSE Log stream established'})}\n\n"
+            for message in pubsub.listen():
+                if message and message['type'] == 'message':
+                    yield f"data: {message['data']}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'event': 'error', 'message': str(e)})}\n\n"
+        finally:
+            if pubsub:
+                try: pubsub.unsubscribe()
+                except: pass
+    return Response(event_generator(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    })
 
 
 @app.errorhandler(404)

@@ -78,7 +78,11 @@ def load_bars_from_preprocessor(instrument: str, timeframe: str) -> List[Dict[st
                         if not line.strip():
                             continue
                         bar_dict = json.loads(line)
-                        if bar_dict.get("instrument", "").upper() == instrument.upper() and bar_dict.get("timeframe", "").upper() == timeframe.upper():
+                        b_tf = bar_dict.get("timeframe", bar_dict.get("tf", ""))
+                        b_tf_clean = b_tf.replace("PERIOD_", "").upper()
+                        tf_clean = timeframe.replace("PERIOD_", "").upper()
+                        
+                        if bar_dict.get("instrument", "").upper() == instrument.upper() and b_tf_clean == tf_clean:
                             final_bars.append(bar_dict)
             except Exception as le:
                 logger.error(f"Error reading live feed: {le}")
@@ -124,6 +128,7 @@ async def run_backtest(config_data: StrategyConfig):
     # Initialize and execute simulator engine
     engine = BacktestEngine(config_data)
     result = engine.run(bars)
+    print(f"DEBUG run_full_backtest loaded {len(bars)} bars result={result.total_trades}", file=sys.stderr)
 
     # Save to disk
     out_path = RESULTS_DIR / f"{config_data.strategy_id}.json"
